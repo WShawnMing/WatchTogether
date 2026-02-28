@@ -1,5 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { createReadStream, existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { createServer, type Server as HttpServer } from 'node:http'
 import path from 'node:path'
 import cors from 'cors'
@@ -23,6 +30,7 @@ import {
   type RoomConfigPayload,
   type RoomMemberSnapshot,
   type RoomSnapshot,
+  type SubtitleSnapshot,
   type SyncMode,
 } from '../../shared/protocol.js'
 
@@ -30,11 +38,18 @@ interface StoredMedia extends MediaSnapshot {
   filePath: string
 }
 
+interface StoredSubtitle extends SubtitleSnapshot {
+  filePath: string
+}
+
 interface RoomState {
   id: string
+  roomName: string
+  password: string | null
   hostSocketId: string
   members: Map<string, RoomMemberSnapshot>
   media: StoredMedia | null
+  subtitle: StoredSubtitle | null
   playbackState: PlaybackState
   syncMode: SyncMode
   resumeAfterBuffer: boolean
@@ -66,14 +81,22 @@ export async function startLocalRelay(
 
   mkdirSync(uploadRoot, { recursive: true })
 
-  function createRoom(roomId: string, hostSocketId: string) {
+  function createRoom(
+    roomId: string,
+    hostSocketId: string,
+    roomName: string,
+    password: string | null,
+  ) {
     const now = Date.now()
 
     const room: RoomState = {
       id: roomId,
+      roomName,
+      password,
       hostSocketId,
       members: new Map(),
       media: null,
+      subtitle: null,
       playbackState: createInitialPlaybackState(hostSocketId),
       syncMode: 'soft',
       resumeAfterBuffer: false,
@@ -93,8 +116,48 @@ export async function startLocalRelay(
       : `Viewer-${Math.floor(Math.random() * 90 + 10)}`
   }
 
-  function ensureRoom(roomId: string, hostSocketId: string) {
-    return rooms.get(roomId) ?? createRoom(roomId, hostSocketId)
+  function sanitizeRoomName(value: string, fallbackNickname: string) {
+    const trimmed = value.trim()
+
+    return trimmed ? trimmed.slice(0, 32) : `${fallbackNickname} 的共享放映室`
+  }
+
+  function sanitizePassword(value?: string) {
+    const trimmed = value?.trim() ?? ''
+
+    return trimmed ? trimmed.slice(0, 64) : null
+  }
+
+  function decodeMultipartName(value: string) {
+    if (!value) {
+      return ''
+    }
+
+    const looksMojibake =
+      /[ÃÂÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]/.test(
+        value,
+      )
+
+    if (!looksMojibake) {
+      return value
+    }
+
+    try {
+      const decoded = Buffer.from(value, 'latin1').toString('utf8')
+
+      return decoded.includes('\uFFFD') ? value : decoded
+    } catch {
+      return value
+    }
+  }
+
+  function ensureRoom(
+    roomId: string,
+    hostSocketId: string,
+    roomName: string,
+    password: string | null,
+  ) {
+    return rooms.get(roomId) ?? createRoom(roomId, hostSocketId, roomName, password)
   }
 
   function getBufferingUsers(room: RoomState) {
@@ -113,6 +176,8 @@ export async function startLocalRelay(
 
     return {
       roomId: room.id,
+      roomName: room.roomName,
+      requiresPassword: Boolean(room.password),
       members,
       media: room.media
         ? {
@@ -122,6 +187,15 @@ export async function startLocalRelay(
             mimeType: room.media.mimeType,
             duration: room.media.duration,
             uploadedAt: room.media.uploadedAt,
+          }
+        : null,
+      subtitle: room.subtitle
+        ? {
+            id: room.subtitle.id,
+            name: room.subtitle.name,
+            format: room.subtitle.format,
+            language: room.subtitle.language,
+            uploadedAt: room.subtitle.uploadedAt,
           }
         : null,
       playbackState: room.playbackState,
@@ -163,6 +237,61 @@ export async function startLocalRelay(
     room.media = null
   }
 
+  function deleteSubtitle(room: RoomState) {
+    if (!room.subtitle) {
+      return
+    }
+
+    try {
+      rmSync(room.subtitle.filePath, { force: true })
+    } catch {
+      // noop
+    }
+
+    room.subtitle = null
+  }
+
+  function normalizeStoredBaseName(fileName: string) {
+    return path
+      .basename(fileName, path.extname(fileName))
+      .replace(/[^\w\u4e00-\u9fa5.-]+/g, '-')
+      .replace(/-+/g, '-')
+      .slice(0, 80)
+  }
+
+  function detectSubtitleLanguage(fileName: string) {
+    const stem = path.basename(fileName, path.extname(fileName)).toLowerCase()
+    const parts = stem.split(/[._\-\s]+/).filter(Boolean)
+    const maybeLanguage = parts.at(-1)
+
+    if (!maybeLanguage || maybeLanguage.length > 8) {
+      return null
+    }
+
+    return maybeLanguage
+  }
+
+  function convertSrtToVtt(content: string) {
+    const normalized = content.replace(/^\uFEFF/, '').replace(/\r+/g, '')
+    const withCueTimes = normalized.replace(
+      /(\d{2}:\d{2}:\d{2}),(\d{3})/g,
+      '$1.$2',
+    )
+
+    return `WEBVTT\n\n${withCueTimes}`
+  }
+
+  function getSubtitleText(buffer: Buffer, originalName: string) {
+    const extension = path.extname(originalName).toLowerCase()
+    const decodedText = buffer.toString('utf8')
+
+    if (extension === '.srt') {
+      return convertSrtToVtt(decodedText)
+    }
+
+    return decodedText.startsWith('WEBVTT') ? decodedText : `WEBVTT\n\n${decodedText}`
+  }
+
   function deleteRoom(roomId: string) {
     const room = rooms.get(roomId)
 
@@ -171,6 +300,7 @@ export async function startLocalRelay(
     }
 
     deleteMedia(room)
+    deleteSubtitle(room)
 
     try {
       rmSync(path.join(uploadRoot, roomId), { recursive: true, force: true })
@@ -288,19 +418,24 @@ export async function startLocalRelay(
       callback(null, roomDir)
     },
     filename: (_request, file, callback) => {
-      const extension = path.extname(file.originalname)
-      const basename = path
-        .basename(file.originalname, extension)
-        .replace(/[^\w\u4e00-\u9fa5.-]+/g, '-')
-        .slice(0, 80)
+      const decodedName = decodeMultipartName(file.originalname)
+      const extension = path.extname(decodedName)
+      const basename = normalizeStoredBaseName(decodedName)
       callback(null, `${Date.now()}-${basename || 'movie'}${extension}`)
     },
   })
 
-  const upload = multer({
+  const mediaUpload = multer({
     storage,
     limits: {
       fileSize: 15 * 1024 * 1024 * 1024,
+    },
+  })
+
+  const subtitleUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: 5 * 1024 * 1024,
     },
   })
 
@@ -324,17 +459,27 @@ export async function startLocalRelay(
     })
   })
 
-  app.post('/api/rooms/:roomId/media', upload.single('video'), (request, response) => {
+  function resolveHostRoom(request: Request, response: express.Response) {
     const room = resolveRoomFromRequest(request)
     const socketId = request.header('x-socket-id') ?? ''
 
     if (!room) {
       response.status(404).json({ error: '房间不存在' })
-      return
+      return null
     }
 
     if (!room.members.has(socketId) || room.hostSocketId !== socketId) {
       response.status(403).json({ error: '只有房主可以上传视频' })
+      return null
+    }
+
+    return { room, socketId }
+  }
+
+  app.post('/api/rooms/:roomId/media', mediaUpload.single('video'), (request, response) => {
+    const context = resolveHostRoom(request, response)
+
+    if (!context) {
       return
     }
 
@@ -343,16 +488,20 @@ export async function startLocalRelay(
       return
     }
 
+    const { room, socketId } = context
+    const resolvedName = decodeMultipartName(request.file.originalname)
     deleteMedia(room)
+    deleteSubtitle(room)
 
     const parsedDuration = Number(request.body.duration)
+
     room.media = {
       id: randomUUID(),
-      name: request.file.originalname,
+      name: resolvedName,
       size: request.file.size,
       mimeType:
         request.file.mimetype ||
-        mime.lookup(request.file.originalname) ||
+        mime.lookup(resolvedName) ||
         'application/octet-stream',
       duration: Number.isFinite(parsedDuration) ? parsedDuration : null,
       uploadedAt: Date.now(),
@@ -381,6 +530,69 @@ export async function startLocalRelay(
       },
     })
   })
+
+  app.post(
+    '/api/rooms/:roomId/subtitle',
+    subtitleUpload.single('subtitle'),
+    (request, response) => {
+      const context = resolveHostRoom(request, response)
+
+      if (!context) {
+        return
+      }
+
+      if (!request.file) {
+        response.status(400).json({ error: '没有收到字幕文件' })
+        return
+      }
+
+      const { room } = context
+      const originalName = decodeMultipartName(request.file.originalname)
+      const extension = path.extname(originalName).toLowerCase()
+
+      if (!['.srt', '.vtt'].includes(extension)) {
+        response.status(400).json({ error: '目前只支持 .srt 和 .vtt 字幕' })
+        return
+      }
+
+      const roomDir = path.join(uploadRoot, room.id)
+      mkdirSync(roomDir, { recursive: true })
+
+      const subtitlePath = path.join(
+        roomDir,
+        `${Date.now()}-${normalizeStoredBaseName(originalName) || 'subtitle'}.vtt`,
+      )
+
+      deleteSubtitle(room)
+      writeFileSync(
+        subtitlePath,
+        getSubtitleText(request.file.buffer, originalName),
+        'utf8',
+      )
+
+      room.subtitle = {
+        id: randomUUID(),
+        name: originalName,
+        format: 'vtt',
+        language: detectSubtitleLanguage(originalName),
+        uploadedAt: Date.now(),
+        filePath: subtitlePath,
+      }
+      room.lastActiveAt = Date.now()
+
+      emitRoomSnapshot(io, room)
+
+      response.json({
+        subtitle: {
+          id: room.subtitle.id,
+          name: room.subtitle.name,
+          format: room.subtitle.format,
+          language: room.subtitle.language,
+          uploadedAt: room.subtitle.uploadedAt,
+        },
+      })
+    },
+  )
 
   app.get('/api/rooms/:roomId/media/:mediaId', (request, response) => {
     const room = resolveRoomFromRequest(request)
@@ -436,18 +648,52 @@ export async function startLocalRelay(
     createReadStream(room.media.filePath, { start, end }).pipe(response)
   })
 
+  app.get('/api/rooms/:roomId/subtitles/:subtitleId', (request, response) => {
+    const room = resolveRoomFromRequest(request)
+
+    if (!room?.subtitle || room.subtitle.id !== request.params.subtitleId) {
+      response.status(404).json({ error: '字幕不存在' })
+      return
+    }
+
+    if (!existsSync(room.subtitle.filePath)) {
+      response.status(404).json({ error: '字幕文件已经被清理' })
+      return
+    }
+
+    response.setHeader('Cache-Control', 'no-store')
+    response.setHeader('Content-Type', 'text/vtt; charset=utf-8')
+    createReadStream(room.subtitle.filePath).pipe(response)
+  })
+
   io.on('connection', (socket) => {
     socket.on(
       'room:join',
       (payload: JoinRoomPayload, callback?: (result: JoinRoomResult) => void) => {
         const roomId = normalizeRoomId(payload.roomId) || createRoomCode()
         const nickname = sanitizeNickname(payload.nickname)
-        const room = ensureRoom(roomId, socket.id)
+        const requestedPassword = sanitizePassword(payload.password)
+        const existingRoom = rooms.get(roomId)
+
+        if (existingRoom?.password && existingRoom.password !== requestedPassword) {
+          callback?.({
+            ok: false,
+            error: '房间密码不正确',
+          })
+          return
+        }
+
+        const room = ensureRoom(
+          roomId,
+          socket.id,
+          sanitizeRoomName(payload.roomName ?? '', nickname),
+          requestedPassword,
+        )
 
         if (!room.members.has(socket.id) && room.members.size >= MAX_ROOM_MEMBERS) {
           callback?.({
             ok: false,
-            error: '房间已满，只支持两人同看',
+            error: '房间人数已满',
           })
           return
         }

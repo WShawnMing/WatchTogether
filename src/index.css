@@ -1,15 +1,19 @@
 :root {
-  --color-bg: #0b0e15;
-  --color-text: #f6f3ef;
-  --color-text-soft: #dfd4ca;
-  --color-text-muted: #988d87;
-  --color-accent: #f6c66c;
+  --color-bg: #eef2f7;
+  --color-surface: rgba(255, 255, 255, 0.88);
+  --color-surface-alt: rgba(248, 250, 252, 0.9);
+  --color-border: rgba(148, 163, 184, 0.2);
+  --color-text: #111827;
+  --color-text-soft: #4b5563;
+  --color-text-muted: #6b7280;
+  --color-accent: #3d82f6;
+  --shadow-panel: 0 24px 60px rgba(15, 23, 42, 0.08);
   color: var(--color-text);
   background:
-    radial-gradient(circle at top, rgba(242, 153, 74, 0.18), transparent 36%),
-    radial-gradient(circle at bottom left, rgba(165, 56, 96, 0.14), transparent 30%),
-    linear-gradient(180deg, #100d15, #090d15 48%, #05070c);
-  font-family: "IBM Plex Sans", "Source Han Sans SC", "Segoe UI Variable", sans-serif;
+    radial-gradient(circle at top left, rgba(61, 130, 246, 0.12), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(15, 23, 42, 0.08), transparent 28%),
+    linear-gradient(180deg, #f7f9fc, #edf2f7 48%, #e9eef5);
+  font-family: "SF Pro Text", "Google Sans Text", "PingFang SC", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -38,12 +42,10 @@ body::before {
   position: fixed;
   inset: 0;
   pointer-events: none;
-  opacity: 0.24;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-  background-size: 38px 38px;
-  mask-image: radial-gradient(circle at center, black 36%, transparent 82%);
+  opacity: 0.32;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.36), transparent 24%),
+    radial-gradient(circle at top right, rgba(255, 255, 255, 0.6), transparent 32%);
 }
 
 a {
@@ -62,18 +64,19 @@ video {
 button {
   cursor: pointer;
   transition:
-    transform 180ms ease,
-    border-color 180ms ease,
-    background 180ms ease;
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
 }
 
-button:hover {
+button:hover:not(:disabled) {
   transform: translateY(-1px);
 }
 
 button:focus-visible,
 input:focus-visible {
-  outline: 2px solid rgba(242, 153, 74, 0.52);
+  outline: 2px solid rgba(61, 130, 246, 0.32);
   outline-offset: 2px;
 }
 

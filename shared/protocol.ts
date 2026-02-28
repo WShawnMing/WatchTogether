@@ -1,7 +1,8 @@
 export type SyncMode = 'soft' | 'strict'
 export type PlaybackReason = 'user' | 'buffer_lock' | 'media_transfer'
 export type PeerRole = 'host' | 'guest'
-export const MAX_ROOM_MEMBERS = 2
+export type DiscoveryPlaybackState = 'idle' | 'paused' | 'playing'
+export const MAX_ROOM_MEMBERS = 6
 
 export interface PlaybackState {
   position: number
@@ -20,6 +21,13 @@ export interface MediaDescriptor {
   duration: number | null
 }
 
+export interface SubtitleDescriptor {
+  id: string
+  name: string
+  format: 'vtt'
+  language: string | null
+}
+
 export interface RoomMemberSnapshot {
   socketId: string
   nickname: string
@@ -32,10 +40,17 @@ export interface MediaSnapshot extends MediaDescriptor {
   uploadedAt: number
 }
 
+export interface SubtitleSnapshot extends SubtitleDescriptor {
+  uploadedAt: number
+}
+
 export interface RoomSnapshot {
   roomId: string
+  roomName: string
+  requiresPassword: boolean
   members: RoomMemberSnapshot[]
   media: MediaSnapshot | null
+  subtitle: SubtitleSnapshot | null
   playbackState: PlaybackState
   syncMode: SyncMode
   maxMembers: number
@@ -53,6 +68,8 @@ export interface PlaybackEnvelope {
 export interface JoinRoomPayload {
   roomId: string
   nickname: string
+  password?: string
+  roomName?: string
 }
 
 export interface JoinRoomResult {
@@ -77,6 +94,51 @@ export interface BufferingPayload {
 export interface RoomConfigPayload {
   roomId: string
   syncMode: SyncMode
+}
+
+export interface DiscoveryAnnouncement {
+  type: 'watchtogether:announce'
+  protocolVersion: 1
+  instanceId: string
+  roomId: string
+  roomName: string
+  hostNickname: string
+  requiresPassword: boolean
+  memberCount: number
+  maxMembers: number
+  mediaName: string | null
+  subtitleName: string | null
+  playbackState: DiscoveryPlaybackState
+  port: number
+  announcedAt: number
+}
+
+export interface DiscoveryAdvertisePayload {
+  roomId: string
+  roomName: string
+  hostNickname: string
+  requiresPassword: boolean
+  memberCount: number
+  maxMembers: number
+  mediaName: string | null
+  subtitleName: string | null
+  playbackState: DiscoveryPlaybackState
+  port: number
+}
+
+export interface DiscoverySession {
+  instanceId: string
+  roomId: string
+  roomName: string
+  hostNickname: string
+  requiresPassword: boolean
+  memberCount: number
+  maxMembers: number
+  mediaName: string | null
+  subtitleName: string | null
+  playbackState: DiscoveryPlaybackState
+  serverUrl: string
+  lastSeenAt: number
 }
 
 export interface PlaybackMessage {

@@ -10,8 +10,10 @@ import './App.css'
 import {
   createRoomCode,
   deriveCurrentPosition,
-  MAX_ROOM_MEMBERS,
   normalizeRoomId,
+  type DiscoveryAdvertisePayload,
+  type DiscoveryPlaybackState,
+  type DiscoverySession,
   type JoinRoomPayload,
   type JoinRoomResult,
   type PlaybackEnvelope,
@@ -22,6 +24,7 @@ import {
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
 type UploadStatus = 'idle' | 'reading' | 'uploading' | 'done' | 'error'
+type SubtitleStatus = 'idle' | 'uploading' | 'done' | 'error'
 
 interface RelayStatus {
   running: boolean
@@ -31,9 +34,11 @@ interface RelayStatus {
   allUrls: string[]
 }
 
-interface InvitePayload {
+interface ConnectRoomOptions {
   roomId: string
   serverUrl: string
+  password?: string
+  roomName?: string
 }
 
 const EMPTY_RELAY_STATUS: RelayStatus = {
@@ -43,6 +48,10 @@ const EMPTY_RELAY_STATUS: RelayStatus = {
   shareUrls: [],
   allUrls: [],
 }
+
+const VIDEO_ACCEPT =
+  '.mp4,.m4v,.mov,.webm,.mkv,.avi,.ts,.mpeg,.mpg,.ogv,.wmv'
+const SUBTITLE_ACCEPT = '.srt,.vtt'
 
 function normalizeServerUrl(input: string) {
   const trimmed = input.trim()
@@ -54,36 +63,6 @@ function normalizeServerUrl(input: string) {
   const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
 
   return withProtocol.replace(/\/+$/, '')
-}
-
-function encodeInvite(payload: InvitePayload) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
-}
-
-function decodeInvite(rawValue: string) {
-  const trimmed = rawValue.trim()
-
-  if (!trimmed) {
-    throw new Error('邀请内容为空')
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed) as InvitePayload
-    if (parsed.roomId && parsed.serverUrl) {
-      return parsed
-    }
-  } catch {
-    // fall through
-  }
-
-  const decoded = decodeURIComponent(escape(atob(trimmed)))
-  const payload = JSON.parse(decoded) as InvitePayload
-
-  if (!payload.roomId || !payload.serverUrl) {
-    throw new Error('邀请内容格式不正确')
-  }
-
-  return payload
 }
 
 function formatDuration(seconds: number) {
@@ -121,6 +100,13 @@ function formatBytes(value: number) {
 function buildMediaUrl(serverUrl: string, roomId: string, mediaId: string) {
   return new URL(
     `/api/rooms/${roomId}/media/${mediaId}`,
+    `${normalizeServerUrl(serverUrl)}/`,
+  ).toString()
+}
+
+function buildSubtitleUrl(serverUrl: string, roomId: string, subtitleId: string) {
+  return new URL(
+    `/api/rooms/${roomId}/subtitles/${subtitleId}`,
     `${normalizeServerUrl(serverUrl)}/`,
   ).toString()
 }
@@ -167,6 +153,49 @@ function readVideoDuration(file: File) {
   })
 }
 
+function getPlaybackLabel(state: DiscoveryPlaybackState) {
+  switch (state) {
+    case 'playing':
+      return '播放中'
+    case 'paused':
+      return '暂停中'
+    default:
+      return '等待开始'
+  }
+}
+
+function getConnectionLabel(state: ConnectionState, relayRunning: boolean) {
+  switch (state) {
+    case 'connected':
+      return '已连接'
+    case 'connecting':
+      return '连接中'
+    case 'reconnecting':
+      return '重连中'
+    default:
+      return relayRunning ? '正在共享' : '空闲'
+  }
+}
+
+function buildRoomName(nickname: string) {
+  const trimmed = nickname.trim()
+  return `${trimmed || 'Someone'} 的共享放映室`
+}
+
+function formatSupportHint(mediaName?: string | null) {
+  if (!mediaName) {
+    return '推荐 MP4/H.264 最稳；MKV 已允许导入，最终是否可播取决于编码。'
+  }
+
+  const extension = mediaName.split('.').pop()?.toLowerCase() ?? ''
+
+  if (['mkv', 'avi', 'wmv'].includes(extension)) {
+    return '当前片源已导入。若无法播放，通常是编码不被内置播放器支持，建议优先使用 H.264/AAC。'
+  }
+
+  return '当前格式通常可直接播放。'
+}
+
 function StatusPill({
   tone,
   children,
@@ -180,11 +209,11 @@ function StatusPill({
 function App() {
   const [serverUrl, setServerUrl] = useState('')
   const [nickname, setNickname] = useState('')
-  const [roomInput, setRoomInput] = useState(createRoomCode())
-  const [inviteInput, setInviteInput] = useState('')
+  const [hostPassword, setHostPassword] = useState('')
+  const [joinPasswords, setJoinPasswords] = useState<Record<string, string>>({})
   const [socketId, setSocketId] = useState('')
-  const [shareUrl, setShareUrl] = useState('')
   const [relayStatus, setRelayStatus] = useState<RelayStatus>(EMPTY_RELAY_STATUS)
+  const [discoveredSessions, setDiscoveredSessions] = useState<DiscoverySession[]>([])
   const [connectionState, setConnectionState] =
     useState<ConnectionState>('idle')
   const [room, setRoom] = useState<RoomSnapshot | null>(null)
@@ -192,13 +221,16 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [localBuffering, setLocalBuffering] = useState(false)
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
-  const [roomCodeCopied, setRoomCodeCopied] = useState(false)
-  const [inviteCopied, setInviteCopied] = useState(false)
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>('idle')
   const [uploadProgress, setUploadProgress] = useState(0)
-  const [uploadLabel, setUploadLabel] = useState('等待导入')
+  const [uploadLabel, setUploadLabel] = useState('还没有选片')
   const [selectedFileName, setSelectedFileName] = useState('')
+  const [subtitleStatus, setSubtitleStatus] =
+    useState<SubtitleStatus>('idle')
+  const [subtitleLabel, setSubtitleLabel] = useState('还没有字幕')
+  const [selectedSubtitleName, setSelectedSubtitleName] = useState('')
   const [relayBusy, setRelayBusy] = useState(false)
+  const [joiningRoomId, setJoiningRoomId] = useState<string | null>(null)
 
   const socketRef = useRef<Socket | null>(null)
   const roomRef = useRef<RoomSnapshot | null>(null)
@@ -212,10 +244,15 @@ function App() {
 
   const currentMember =
     room?.members.find((member) => member.socketId === socketId) ?? null
+  const hostMember = room?.members.find((member) => member.isHost) ?? null
   const isHost = Boolean(currentMember?.isHost)
   const mediaUrl =
     room?.media && room.roomId && serverUrl
       ? buildMediaUrl(serverUrl, room.roomId, room.media.id)
+      : null
+  const subtitleUrl =
+    room?.subtitle && room.roomId && serverUrl
+      ? buildSubtitleUrl(serverUrl, room.roomId, room.subtitle.id)
       : null
   const audienceCount = room?.members.length ?? 0
   const syncMode = room?.syncMode ?? 'soft'
@@ -223,28 +260,116 @@ function App() {
   const playbackPosition = playback
     ? deriveCurrentPosition(playback.playbackState, playback.serverTime)
     : 0
+  const connectionLabel = getConnectionLabel(
+    connectionState,
+    relayStatus.running,
+  )
+  const videoKey = `${room?.media?.id ?? 'empty'}:${room?.subtitle?.id ?? 'nosub'}`
 
   useEffect(() => {
     roomRef.current = room
   }, [room])
 
   useEffect(() => {
+    const savedNickname = window.localStorage.getItem('watchtogether:nickname')
+
+    if (savedNickname) {
+      setNickname(savedNickname)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (nickname.trim()) {
+      window.localStorage.setItem('watchtogether:nickname', nickname.trim())
+    }
+  }, [nickname])
+
+  useEffect(() => {
     if (!window.desktopApp?.relay) {
       return
     }
 
-    void window.desktopApp.relay.status().then((status) => {
+    void window.desktopApp.relay.status().then((status: RelayStatus) => {
       setRelayStatus(status)
 
       if (status.localUrl && !serverUrl) {
         setServerUrl(status.localUrl)
       }
-
-      if (!shareUrl && status.shareUrls.length > 0) {
-        setShareUrl(status.shareUrls[0])
-      }
     })
-  }, [serverUrl, shareUrl])
+  }, [serverUrl])
+
+  useEffect(() => {
+    if (!window.desktopApp?.discovery) {
+      return
+    }
+
+    let disposed = false
+
+    const refresh = async () => {
+      try {
+        const sessions = await window.desktopApp?.discovery.list()
+
+        if (!disposed && sessions) {
+          startTransition(() => {
+            setDiscoveredSessions(sessions)
+          })
+        }
+      } catch {
+        if (!disposed) {
+          setDiscoveredSessions([])
+        }
+      }
+    }
+
+    void refresh()
+
+    const interval = window.setInterval(() => {
+      void refresh()
+    }, 2_000)
+
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!window.desktopApp?.discovery || !relayStatus.running || !relayStatus.port || !room || !isHost) {
+      void window.desktopApp?.discovery?.advertise(null)
+      return
+    }
+
+    const payload: DiscoveryAdvertisePayload = {
+      roomId: room.roomId,
+      roomName: room.roomName,
+      hostNickname: hostMember?.nickname ?? (nickname.trim() || 'Host'),
+      requiresPassword: room.requiresPassword,
+      memberCount: room.members.length,
+      maxMembers: room.maxMembers,
+      mediaName: room.media?.name ?? null,
+      subtitleName: room.subtitle?.name ?? null,
+      playbackState: room.media
+        ? playback?.playbackState.paused
+          ? 'paused'
+          : 'playing'
+        : 'idle',
+      port: relayStatus.port,
+    }
+
+    void window.desktopApp.discovery.advertise(payload)
+
+    return () => {
+      void window.desktopApp?.discovery?.advertise(null)
+    }
+  }, [
+    hostMember?.nickname,
+    isHost,
+    nickname,
+    playback?.playbackState.paused,
+    relayStatus.port,
+    relayStatus.running,
+    room,
+  ])
 
   const suppressLocalPlaybackEvents = useCallback((duration = 300) => {
     suppressEventsRef.current = true
@@ -340,6 +465,7 @@ function App() {
         window.clearTimeout(suppressTimeoutRef.current)
       }
 
+      void window.desktopApp?.discovery?.advertise(null)
       socketRef.current?.disconnect()
     }
   }, [])
@@ -356,10 +482,20 @@ function App() {
     }
 
     roomRef.current = snapshot
+
     startTransition(() => {
       setRoom(snapshot)
       setPlayback(roomSnapshotToPlayback(snapshot))
     })
+
+    if (snapshot.subtitle) {
+      setSelectedSubtitleName(snapshot.subtitle.name)
+      setSubtitleLabel('字幕已同步给所有人')
+    } else {
+      setSelectedSubtitleName('')
+      setSubtitleLabel('还没有字幕')
+    }
+
     setErrorMessage(null)
   }
 
@@ -423,6 +559,7 @@ function App() {
     }
 
     const status = await window.desktopApp.relay.start()
+
     setRelayStatus({
       running: true,
       port: status.port,
@@ -432,30 +569,28 @@ function App() {
     })
     setServerUrl(status.localUrl)
 
-    if (status.shareUrls.length > 0) {
-      setShareUrl(status.shareUrls[0])
-    }
-
     return status
   }
 
-  const connectToRoom = async (
-    desiredRoomId: string,
-    overrideServerUrl?: string,
-  ) => {
-    const resolvedRoomId = normalizeRoomId(desiredRoomId) || createRoomCode()
-    const resolvedNickname =
-      nickname.trim() || `Viewer-${Math.floor(Math.random() * 90 + 10)}`
-    const resolvedServerUrl = normalizeServerUrl(overrideServerUrl ?? serverUrl)
+  const connectToRoom = async ({
+    roomId,
+    serverUrl: nextServerUrl,
+    password,
+    roomName,
+  }: ConnectRoomOptions) => {
+    const resolvedRoomId = normalizeRoomId(roomId) || createRoomCode()
+    const resolvedNickname = nickname.trim()
+    const resolvedServerUrl = normalizeServerUrl(nextServerUrl)
+
+    if (!resolvedNickname) {
+      throw new Error('先输入一个昵称')
+    }
 
     if (!resolvedServerUrl) {
-      setErrorMessage('请先填房主的直连地址，或由房主先启动本机分享服务')
-      return
+      throw new Error('房主地址不可用')
     }
 
     setServerUrl(resolvedServerUrl)
-    setRoomInput(resolvedRoomId)
-    setNickname(resolvedNickname)
     setConnectionState('connecting')
     setErrorMessage(null)
     manualDisconnectRef.current = false
@@ -467,71 +602,107 @@ function App() {
       transports: ['websocket', 'polling'],
       autoConnect: false,
       reconnection: true,
-      reconnectionDelayMax: 4000,
+      reconnectionDelayMax: 4_000,
     })
 
     joinPayloadRef.current = {
       roomId: resolvedRoomId,
       nickname: resolvedNickname,
+      password: password?.trim() || undefined,
+      roomName,
     }
 
-    nextSocket.on('connect', () => {
-      const payload = joinPayloadRef.current
+    socketRef.current = nextSocket
 
-      setSocketId(nextSocket.id ?? '')
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
 
-      if (!payload) {
-        return
-      }
-
-      nextSocket.emit('room:join', payload, (result: JoinRoomResult) => {
-        if (!result.ok || !result.snapshot) {
-          setErrorMessage(result.error ?? '加入房间失败')
-          setConnectionState('idle')
-          nextSocket.disconnect()
+      const resolveOnce = () => {
+        if (settled) {
           return
         }
 
-        handleSnapshot(result.snapshot)
-        setConnectionState('connected')
-        nextSocket.emit('playback:request-state', {
-          roomId: result.snapshot.roomId,
-        })
-      })
-    })
-
-    nextSocket.on('connect_error', (error: Error) => {
-      setErrorMessage(error.message || '无法连接房主设备')
-      setConnectionState('idle')
-    })
-
-    nextSocket.on('reconnect_attempt', () => {
-      setConnectionState('reconnecting')
-    })
-
-    nextSocket.on('disconnect', () => {
-      setSocketId('')
-
-      if (manualDisconnectRef.current) {
-        setConnectionState('idle')
-        return
+        settled = true
+        resolve()
       }
 
-      setConnectionState('reconnecting')
-    })
+      const rejectOnce = (error: Error) => {
+        if (settled) {
+          return
+        }
 
-    nextSocket.on('room:snapshot', (snapshot: RoomSnapshot) => {
-      handleSnapshot(snapshot)
-    })
-    nextSocket.on('playback:state', (incoming: PlaybackEnvelope) => {
-      handlePlayback(incoming)
-    })
-    nextSocket.on('room:error', (message: string) => {
-      setErrorMessage(message)
-    })
+        settled = true
+        reject(error)
+      }
 
-    socketRef.current = nextSocket
-    nextSocket.connect()
+      nextSocket.on('connect', () => {
+        const payload = joinPayloadRef.current
+
+        setSocketId(nextSocket.id ?? '')
+
+        if (!payload) {
+          rejectOnce(new Error('加入参数丢失'))
+          return
+        }
+
+        nextSocket.emit('room:join', payload, (result: JoinRoomResult) => {
+          if (!result.ok || !result.snapshot) {
+            const error = new Error(result.error ?? '加入房间失败')
+            setErrorMessage(error.message)
+            setConnectionState('idle')
+            setJoiningRoomId(null)
+            nextSocket.disconnect()
+            rejectOnce(error)
+            return
+          }
+
+          handleSnapshot(result.snapshot)
+          setConnectionState('connected')
+          setJoiningRoomId(null)
+          nextSocket.emit('playback:request-state', {
+            roomId: result.snapshot.roomId,
+          })
+          resolveOnce()
+        })
+      })
+
+      nextSocket.on('connect_error', (error: Error) => {
+        const nextError = new Error(error.message || '无法连接房主设备')
+        setErrorMessage(nextError.message)
+        setConnectionState('idle')
+        setJoiningRoomId(null)
+        rejectOnce(nextError)
+      })
+
+      nextSocket.io.on('reconnect_attempt', () => {
+        setConnectionState('reconnecting')
+      })
+
+      nextSocket.on('disconnect', () => {
+        setSocketId('')
+
+        if (manualDisconnectRef.current) {
+          setConnectionState('idle')
+          return
+        }
+
+        setConnectionState('reconnecting')
+      })
+
+      nextSocket.on('room:snapshot', (snapshot: RoomSnapshot) => {
+        handleSnapshot(snapshot)
+      })
+
+      nextSocket.on('playback:state', (incoming: PlaybackEnvelope) => {
+        handlePlayback(incoming)
+      })
+
+      nextSocket.on('room:error', (message: string) => {
+        setErrorMessage(message)
+      })
+
+      nextSocket.connect()
+    })
   }
 
   const disconnectFromRoom = () => {
@@ -549,55 +720,83 @@ function App() {
     setAutoplayBlocked(false)
     setUploadStatus('idle')
     setUploadProgress(0)
-    setUploadLabel('等待导入')
+    setUploadLabel('还没有选片')
     setSelectedFileName('')
+    setSubtitleStatus('idle')
+    setSubtitleLabel('还没有字幕')
+    setSelectedSubtitleName('')
+    setJoiningRoomId(null)
     socketRef.current?.removeAllListeners()
     socketRef.current?.disconnect()
     socketRef.current = null
   }
 
-  const copyRoomCode = async () => {
-    if (!room?.roomId) {
-      return
-    }
+  const startSharing = async () => {
+    setRelayBusy(true)
+    setErrorMessage(null)
 
     try {
-      await navigator.clipboard.writeText(room.roomId)
-      setRoomCodeCopied(true)
-      window.setTimeout(() => setRoomCodeCopied(false), 1600)
-    } catch {
-      setErrorMessage('复制房间号失败，请手动发送给对方')
-    }
-  }
-
-  const copyInvite = async () => {
-    if (!room?.roomId || !shareUrl) {
-      setErrorMessage('请先启动本机分享服务并创建房间')
-      return
-    }
-
-    const token = encodeInvite({
-      roomId: room.roomId,
-      serverUrl: shareUrl,
-    })
-
-    try {
-      await navigator.clipboard.writeText(token)
-      setInviteCopied(true)
-      window.setTimeout(() => setInviteCopied(false), 1600)
-    } catch {
-      setErrorMessage('复制邀请失败，请手动复制分享地址和房间号')
-    }
-  }
-
-  const applyInvite = () => {
-    try {
-      const payload = decodeInvite(inviteInput)
-      setServerUrl(normalizeServerUrl(payload.serverUrl))
-      setRoomInput(normalizeRoomId(payload.roomId))
-      setErrorMessage(null)
+      const relay = await ensureLocalRelay()
+      await connectToRoom({
+        roomId: createRoomCode(),
+        serverUrl: relay.localUrl,
+        password: hostPassword,
+        roomName: buildRoomName(nickname),
+      })
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '邀请解析失败')
+      setErrorMessage(error instanceof Error ? error.message : '启动共享失败')
+    } finally {
+      setRelayBusy(false)
+    }
+  }
+
+  const stopHosting = async () => {
+    if (!window.desktopApp?.relay) {
+      setErrorMessage('当前环境没有桌面端直连能力')
+      return
+    }
+
+    setRelayBusy(true)
+    setErrorMessage(null)
+
+    try {
+      disconnectFromRoom()
+      await window.desktopApp.discovery.advertise(null)
+      await window.desktopApp.relay.stop()
+      setRelayStatus(EMPTY_RELAY_STATUS)
+      setServerUrl('')
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '停止共享失败')
+    } finally {
+      setRelayBusy(false)
+    }
+  }
+
+  const leaveRoom = () => {
+    if (isHost) {
+      void stopHosting()
+      return
+    }
+
+    disconnectFromRoom()
+  }
+
+  const joinDiscoveredRoom = async (session: DiscoverySession) => {
+    const sessionKey = `${session.instanceId}:${session.roomId}`
+
+    setJoiningRoomId(sessionKey)
+    setErrorMessage(null)
+
+    try {
+      await connectToRoom({
+        roomId: session.roomId,
+        serverUrl: session.serverUrl,
+        password: joinPasswords[sessionKey] ?? '',
+      })
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '加入共享失败')
+    } finally {
+      setJoiningRoomId(null)
     }
   }
 
@@ -606,14 +805,14 @@ function App() {
     const currentRoom = roomRef.current
 
     if (!socket || !currentRoom) {
-      setErrorMessage('请先连接房间，再导入视频')
+      setErrorMessage('请先加入房间，再导入视频')
       return
     }
 
     setSelectedFileName(file.name)
     setUploadStatus('reading')
     setUploadProgress(0)
-    setUploadLabel('读取视频元信息')
+    setUploadLabel('读取片源信息')
     setErrorMessage(null)
 
     const duration = await readVideoDuration(file)
@@ -625,7 +824,7 @@ function App() {
     }
 
     setUploadStatus('uploading')
-    setUploadLabel('复制到房主本机直连服务')
+    setUploadLabel('正在把片源挂到你的本机共享服务')
 
     await new Promise<void>((resolve, reject) => {
       const request = new XMLHttpRequest()
@@ -647,7 +846,7 @@ function App() {
         if (request.status >= 200 && request.status < 300) {
           setUploadStatus('done')
           setUploadProgress(100)
-          setUploadLabel('片源已挂载，另一端会直接从你机器拉流')
+          setUploadLabel('片源已同步，其他人会直接从你的设备拉流')
           resolve()
           return
         }
@@ -658,307 +857,493 @@ function App() {
           const payload = JSON.parse(request.responseText) as { error?: string }
           message = payload.error ?? message
         } catch {
-          // ignore malformed payloads
+          // Ignore malformed payloads.
         }
 
         reject(new Error(message))
       }
 
       request.onerror = () => {
-        reject(new Error('导入中断，请检查本机直连服务'))
+        reject(new Error('导入中断，请检查本机共享服务'))
       }
 
       request.send(formData)
     }).catch((error: unknown) => {
       setUploadStatus('error')
-      setUploadLabel('导入失败')
+      setUploadLabel('片源导入失败')
       setErrorMessage(error instanceof Error ? error.message : '导入失败')
     })
   }
 
-  const hostAndCreateRoom = async () => {
-    try {
-      setRelayBusy(true)
-      const relay = await ensureLocalRelay()
-      await connectToRoom(createRoomCode(), relay.localUrl)
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : '启动本机分享服务失败',
-      )
-    } finally {
-      setRelayBusy(false)
-    }
-  }
+  const uploadSubtitle = async (file: File) => {
+    const socket = socketRef.current
+    const currentRoom = roomRef.current
 
-  const stopHosting = async () => {
-    if (!window.desktopApp?.relay) {
-      setErrorMessage('当前环境没有桌面端直连能力')
+    if (!socket || !currentRoom) {
+      setErrorMessage('请先加入房间，再上传字幕')
       return
     }
 
-    setRelayBusy(true)
+    setSelectedSubtitleName(file.name)
+    setSubtitleStatus('uploading')
+    setSubtitleLabel('正在同步字幕文件')
     setErrorMessage(null)
 
+    const formData = new FormData()
+    formData.append('subtitle', file)
+
     try {
-      disconnectFromRoom()
-      await window.desktopApp.relay.stop()
-      setRelayStatus(EMPTY_RELAY_STATUS)
-      setShareUrl('')
-      setServerUrl('')
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : '停止本机分享失败',
+      const response = await fetch(
+        `${normalizeServerUrl(serverUrl)}/api/rooms/${currentRoom.roomId}/subtitle`,
+        {
+          method: 'POST',
+          headers: {
+            'x-socket-id': socket.id ?? '',
+          },
+          body: formData,
+        },
       )
-    } finally {
-      setRelayBusy(false)
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: string }
+          | null
+        throw new Error(payload?.error ?? '字幕上传失败')
+      }
+
+      setSubtitleStatus('done')
+      setSubtitleLabel('字幕已同步给所有人')
+    } catch (error) {
+      setSubtitleStatus('error')
+      setSubtitleLabel('字幕上传失败')
+      setErrorMessage(error instanceof Error ? error.message : '字幕上传失败')
     }
   }
 
   return (
-    <div className="shell">
-      <header className="hero">
-        <div className="hero__copy">
-          <p className="eyebrow">{getPlatformLabel()} · 局域网 / 蒲公英直连</p>
-          <h1>房主本机直出，对端直接拉流。</h1>
-          <p className="hero__lead">
-            这版按同一局域网或虚拟局域网设计。房主设备本身就是分享节点，不经过第三方中转服务器；另一端直接连接房主的 VPN/LAN 地址观看同一部电影。
+    <div className="app-shell">
+      <header className="topbar">
+        <div>
+          <p className="topbar__eyebrow">WatchTogether</p>
+          <h1>同一局域网，直接一起看。</h1>
+          <p className="topbar__lead">
+            两边进入同一个局域网或虚拟局域网后，输入昵称即可发现正在共享的房间。房主选片后，播放、暂停、拖动和字幕会自动同步。
           </p>
         </div>
 
-        <div className="hero__meta">
-          <div className="hero-card">
-            <span>支持平台</span>
-            <strong>macOS / Windows</strong>
-          </div>
-          <div className="hero-card">
-            <span>连接方式</span>
-            <strong>P2P 局域网直连</strong>
-          </div>
-          <div className="hero-card">
-            <span>同步模式</span>
-            <strong>{syncModeLabel}</strong>
-          </div>
+        <div className="topbar__meta">
+          <StatusPill tone="neutral">{getPlatformLabel()}</StatusPill>
+          <StatusPill
+            tone={
+              connectionState === 'connected'
+                ? 'success'
+                : connectionState === 'reconnecting'
+                  ? 'warning'
+                  : relayStatus.running
+                    ? 'accent'
+                    : 'neutral'
+            }
+          >
+            {connectionLabel}
+          </StatusPill>
         </div>
       </header>
 
-      <main className="layout">
-        <section className="panel panel--lobby">
-          <div className="panel__header">
-            <div>
-              <p className="panel__eyebrow">Direct Link</p>
-              <h2>直连配置</h2>
-            </div>
-            <StatusPill
-              tone={
-                connectionState === 'connected'
-                  ? 'success'
-                  : connectionState === 'reconnecting'
-                    ? 'warning'
-                    : relayStatus.running
-                      ? 'accent'
-                      : 'neutral'
-              }
-            >
-              {connectionState === 'connected'
-                ? '观影已连接'
-                : connectionState === 'reconnecting'
-                  ? '房间重连中'
-                  : relayStatus.running
-                    ? '本机分享中'
-                    : '待启动'}
-            </StatusPill>
-          </div>
+      {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
 
-          <div className="panel-block">
-            <div className="panel-block__title">
-              <h3>房主模式</h3>
-              <StatusPill tone={relayStatus.running ? 'success' : 'neutral'}>
-                {relayStatus.running ? '已启动' : '未启动'}
-              </StatusPill>
-            </div>
-
-            <div className="actions">
-              <button
-                className="button button--primary"
-                onClick={() => void hostAndCreateRoom()}
-                disabled={relayBusy}
-              >
-                {relayBusy ? '处理中...' : '启动本机分享并建房'}
-              </button>
-              <button
-                className="button button--secondary"
-                onClick={() => void stopHosting()}
-                disabled={relayBusy || !relayStatus.running}
-              >
-                停止本机分享
-              </button>
-            </div>
-
-            <div className="room-card">
-              <div className="room-card__row">
-                <span>本机连接地址</span>
-                <strong>{relayStatus.localUrl ?? '未启动'}</strong>
+      <main className="workspace">
+        <aside className="sidebar">
+          <section className="panel">
+            <div className="panel__header">
+              <div>
+                <p className="panel__eyebrow">Profile</p>
+                <h2>我的身份</h2>
               </div>
-              <div className="room-card__row">
-                <span>推荐分享地址</span>
-                <strong>{shareUrl || '未检测到外部地址'}</strong>
-              </div>
-              {relayStatus.shareUrls.length > 1 ? (
-                <p className="hint">
-                  检测到多个网卡地址：{relayStatus.shareUrls.join(' / ')}
-                </p>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="panel-block">
-            <div className="panel-block__title">
-              <h3>加入模式</h3>
-              <StatusPill tone="accent">对端直连</StatusPill>
+              <StatusPill tone="accent">自动发现</StatusPill>
             </div>
 
             <label className="field">
-              <span>邀请串</span>
-              <textarea
-                className="field__textarea"
-                value={inviteInput}
-                onChange={(event) => setInviteInput(event.target.value)}
-                placeholder="贴入房主复制给你的邀请串"
+              <span>昵称</span>
+              <input
+                value={nickname}
+                onChange={(event) => setNickname(event.target.value)}
+                placeholder="输入一个昵称"
+                maxLength={24}
               />
             </label>
 
-            <div className="actions actions--tight">
-              <button className="button button--secondary" onClick={applyInvite}>
-                解析邀请
+            <label className="field">
+              <span>房间密码（可选）</span>
+              <input
+                type="password"
+                value={hostPassword}
+                onChange={(event) => setHostPassword(event.target.value)}
+                placeholder="不填就是公开房间"
+                maxLength={64}
+                disabled={isHost}
+              />
+            </label>
+
+            <div className="button-row">
+              <button
+                className="button button--primary"
+                onClick={() => void startSharing()}
+                disabled={relayBusy || isHost}
+              >
+                {relayBusy ? '处理中...' : isHost ? '你正在共享' : '开始共享'}
               </button>
               <button
                 className="button button--secondary"
-                onClick={() => {
-                  void navigator.clipboard.readText().then((text) => {
-                    setInviteInput(text)
-                  })
-                }}
+                onClick={leaveRoom}
+                disabled={!room && !relayStatus.running}
               >
-                粘贴剪贴板
+                {isHost ? '停止共享' : '离开房间'}
               </button>
             </div>
-          </div>
 
-          <label className="field">
-            <span>房主地址</span>
-            <input
-              value={serverUrl}
-              onChange={(event) => setServerUrl(event.target.value)}
-              placeholder="例如 http://100.64.0.12:4000"
-              disabled={connectionState === 'connecting'}
-            />
-          </label>
+            <p className="support-note">
+              {relayStatus.running && relayStatus.shareUrls[0]
+                ? `共享地址已经就绪，附近设备会自动看到你。`
+                : '如果虚拟局域网不转发广播，后续可以再补一个高级直连入口。'}
+            </p>
+          </section>
 
-          <label className="field">
-            <span>你的昵称</span>
-            <input
-              value={nickname}
-              onChange={(event) => setNickname(event.target.value)}
-              placeholder="Shawn"
-              maxLength={24}
-            />
-          </label>
+          <section className="panel">
+            <div className="panel__header">
+              <div>
+                <p className="panel__eyebrow">Nearby</p>
+                <h2>附近正在共享</h2>
+              </div>
+              <StatusPill tone="neutral">{`${discoveredSessions.length} 个房间`}</StatusPill>
+            </div>
 
-          <label className="field">
-            <span>房间号</span>
-            <input
-              value={roomInput}
-              onChange={(event) => setRoomInput(event.target.value.toUpperCase())}
-              placeholder="6 位房间号"
-              maxLength={8}
-            />
-          </label>
+            <div className="session-list">
+              {discoveredSessions.length ? (
+                discoveredSessions.map((session) => {
+                  const sessionKey = `${session.instanceId}:${session.roomId}`
 
-          <div className="actions">
-            <button
-              className="button button--primary"
-              onClick={() => {
-                void connectToRoom(roomInput)
-              }}
-            >
-              连接房主
-            </button>
-            <button className="button button--ghost" onClick={disconnectFromRoom}>
-              断开连接
-            </button>
-          </div>
+                  return (
+                    <article className="session-card" key={sessionKey}>
+                      <div className="session-card__header">
+                        <div>
+                          <strong>{session.roomName}</strong>
+                          <p>
+                            {session.hostNickname} · {session.memberCount}/
+                            {session.maxMembers} 在线
+                          </p>
+                        </div>
+
+                        <div className="session-card__pills">
+                          <StatusPill
+                            tone={session.requiresPassword ? 'warning' : 'success'}
+                          >
+                            {session.requiresPassword ? '已加密' : '公开'}
+                          </StatusPill>
+                          <StatusPill tone="neutral">
+                            {getPlaybackLabel(session.playbackState)}
+                          </StatusPill>
+                        </div>
+                      </div>
+
+                      <p className="session-card__meta">
+                        {session.mediaName ?? '房主还没有选片'}
+                      </p>
+                      <p className="session-card__submeta">
+                        {session.subtitleName
+                          ? `字幕：${session.subtitleName}`
+                          : '当前没有字幕'}
+                      </p>
+
+                      <div className="session-card__actions">
+                        {session.requiresPassword ? (
+                          <input
+                            type="password"
+                            value={joinPasswords[sessionKey] ?? ''}
+                            onChange={(event) => {
+                              const nextValue = event.target.value
+                              setJoinPasswords((current) => ({
+                                ...current,
+                                [sessionKey]: nextValue,
+                              }))
+                            }}
+                            placeholder="输入房间密码"
+                          />
+                        ) : null}
+
+                        <button
+                          className="button button--secondary"
+                          onClick={() => void joinDiscoveredRoom(session)}
+                          disabled={joiningRoomId === sessionKey}
+                        >
+                          {joiningRoomId === sessionKey ? '加入中...' : '加入观看'}
+                        </button>
+                      </div>
+                    </article>
+                  )
+                })
+              ) : (
+                <div className="empty-state">
+                  <strong>还没有发现共享房间</strong>
+                  <p>确认双方已经在同一个局域网或蒲公英等虚拟局域网里。</p>
+                </div>
+              )}
+            </div>
+          </section>
 
           {room ? (
-            <div className="room-card">
-              <div className="room-card__row">
-                <span>当前房间</span>
-                <strong>{room.roomId}</strong>
-              </div>
-              <div className="room-card__row">
-                <span>成员数</span>
-                <strong>
-                  {audienceCount}/{MAX_ROOM_MEMBERS}
-                </strong>
-              </div>
-              <div className="room-card__row">
-                <span>控制策略</span>
-                <strong>{syncModeLabel}</strong>
+            <section className="panel">
+              <div className="panel__header">
+                <div>
+                  <p className="panel__eyebrow">Room</p>
+                  <h2>当前房间</h2>
+                </div>
+                <StatusPill tone={isHost ? 'accent' : 'neutral'}>
+                  {isHost ? '房主' : '观影方'}
+                </StatusPill>
               </div>
 
-              <div className="actions actions--tight">
-                <button
-                  className="button button--secondary"
-                  onClick={() => {
-                    void copyRoomCode()
-                  }}
-                >
-                  {roomCodeCopied ? '已复制房间号' : '复制房间号'}
-                </button>
-                <button
-                  className="button button--secondary"
-                  onClick={() => {
-                    void copyInvite()
-                  }}
-                >
-                  {inviteCopied ? '已复制邀请' : '复制邀请串'}
-                </button>
+              <div className="summary-list">
+                <div className="summary-item">
+                  <span>房间名</span>
+                  <strong>{room.roomName}</strong>
+                </div>
+                <div className="summary-item">
+                  <span>同步模式</span>
+                  <strong>{syncModeLabel}</strong>
+                </div>
+                <div className="summary-item">
+                  <span>在线成员</span>
+                  <strong>{audienceCount}</strong>
+                </div>
+              </div>
+
+              <div className="member-list">
+                {room.members.map((member) => (
+                  <article className="member-card" key={member.socketId}>
+                    <div>
+                      <strong>{member.nickname}</strong>
+                      <p>{member.isHost ? '房主' : '正在观看'}</p>
+                    </div>
+                    <StatusPill tone={member.buffering ? 'warning' : 'success'}>
+                      {member.buffering ? '缓冲中' : '已就绪'}
+                    </StatusPill>
+                  </article>
+                ))}
+              </div>
+
+              {isHost ? (
+                <div className="segment">
+                  <button
+                    className={`segment__button ${
+                      syncMode === 'soft' ? 'segment__button--active' : ''
+                    }`}
+                    onClick={() => {
+                      socketRef.current?.emit('room:config', {
+                        roomId: room.roomId,
+                        syncMode: 'soft' as SyncMode,
+                      })
+                    }}
+                  >
+                    柔性同步
+                  </button>
+                  <button
+                    className={`segment__button ${
+                      syncMode === 'strict' ? 'segment__button--active' : ''
+                    }`}
+                    onClick={() => {
+                      socketRef.current?.emit('room:config', {
+                        roomId: room.roomId,
+                        syncMode: 'strict' as SyncMode,
+                      })
+                    }}
+                  >
+                    严格同步
+                  </button>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+        </aside>
+
+        <section className="content">
+          <section className="panel panel--session">
+            <div className="panel__header panel__header--stack">
+              <div>
+                <p className="panel__eyebrow">Session</p>
+                <h2>{room?.roomName ?? '先开始共享，或加入附近房间'}</h2>
+                <p className="session-copy">
+                  {room
+                    ? `${hostMember?.nickname ?? '房主'} 正在共享这场观影。`
+                    : '你不需要再手动发房间号或邀请串。只要在同一个网络里，房间会直接出现在左侧。'}
+                </p>
+              </div>
+
+              <div className="panel__chips">
+                <StatusPill tone={room?.media ? 'success' : 'neutral'}>
+                  {room?.media ? '片源已就绪' : '等待片源'}
+                </StatusPill>
+                <StatusPill tone={room?.subtitle ? 'accent' : 'neutral'}>
+                  {room?.subtitle ? '字幕已同步' : '暂无字幕'}
+                </StatusPill>
+                <StatusPill tone={localBuffering ? 'warning' : 'neutral'}>
+                  {localBuffering ? '本地缓冲中' : syncModeLabel}
+                </StatusPill>
               </div>
             </div>
-          ) : (
-            <p className="hint">
-              推荐流程是：双方先用蒲公英等工具进入同一虚拟局域网；房主点击“启动本机分享并建房”，把邀请串发给另一方；另一方解析后直接连接。
-            </p>
-          )}
 
-          {isHost ? (
-            <div className="panel-block">
-              <div className="panel-block__title">
-                <h3>共享视频</h3>
-                <StatusPill tone="accent">房主操作</StatusPill>
+            {isHost ? (
+              <div className="upload-toolbar">
+                <label className="button button--primary button--file">
+                  选择影片
+                  <input
+                    type="file"
+                    accept={VIDEO_ACCEPT}
+                    onChange={(event) => {
+                      const nextFile = event.target.files?.[0]
+
+                      if (!nextFile) {
+                        return
+                      }
+
+                      void uploadMedia(nextFile)
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+
+                <label className="button button--secondary button--file">
+                  上传字幕
+                  <input
+                    type="file"
+                    accept={SUBTITLE_ACCEPT}
+                    onChange={(event) => {
+                      const nextFile = event.target.files?.[0]
+
+                      if (!nextFile) {
+                        return
+                      }
+
+                      void uploadSubtitle(nextFile)
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+
+                <p className="support-note">{formatSupportHint(selectedFileName || room?.media?.name)}</p>
               </div>
+            ) : (
+              <p className="support-note">{formatSupportHint(room?.media?.name)}</p>
+            )}
 
-              <label className="upload-dropzone">
-                <input
-                  type="file"
-                  accept="video/*"
-                  onChange={(event) => {
-                    const nextFile = event.target.files?.[0]
-
-                    if (!nextFile) {
-                      return
-                    }
-
-                    void uploadMedia(nextFile)
-                    event.target.value = ''
+            <div className="player-frame">
+              {mediaUrl ? (
+                <video
+                  key={videoKey}
+                  ref={videoRef}
+                  className="video"
+                  src={mediaUrl}
+                  controls
+                  playsInline
+                  preload="auto"
+                  onPlay={() => {
+                    setAutoplayBlocked(false)
+                    publishPlaybackIntent('user')
                   }}
-                />
-                <span>选择一部本地电影挂到你的分享节点</span>
-                <strong>
-                  {selectedFileName || '推荐在组网稳定后导入 mp4 / mkv / mov 文件'}
-                </strong>
-              </label>
+                  onPause={() => publishPlaybackIntent('user')}
+                  onSeeked={() => publishPlaybackIntent('user')}
+                  onRateChange={() => publishPlaybackIntent('user')}
+                  onLoadedMetadata={() => {
+                    const pending = pendingPlaybackRef.current ?? playback
 
-              <div className="progress">
+                    if (pending) {
+                      applyRemotePlayback(pending)
+                    }
+                  }}
+                  onWaiting={() => publishBufferState(true)}
+                  onStalled={() => publishBufferState(true)}
+                  onCanPlay={() => {
+                    if (localBufferingRef.current) {
+                      publishBufferState(false)
+                    }
+                  }}
+                  onPlaying={() => {
+                    setAutoplayBlocked(false)
+
+                    if (localBufferingRef.current) {
+                      publishBufferState(false)
+                      requestFreshPlaybackState()
+                    }
+                  }}
+                  onEnded={() => publishPlaybackIntent('user')}
+                  onError={() => {
+                    setErrorMessage(
+                      '当前片源的编码可能不被内置播放器支持。建议优先使用 H.264/AAC 的 MP4，或确认 MKV 内部编码可播放。',
+                    )
+                  }}
+                >
+                  {subtitleUrl ? (
+                    <track
+                      default
+                      kind="subtitles"
+                      label={room?.subtitle?.name ?? '字幕'}
+                      src={subtitleUrl}
+                      srcLang={room?.subtitle?.language ?? 'zh'}
+                    />
+                  ) : null}
+                </video>
+              ) : (
+                <div className="video video--placeholder">
+                  <div>
+                    <p>还没有共享视频</p>
+                    <strong>房主选片后，大家会直接拉取同一份片源并保持时间轴一致。</strong>
+                  </div>
+                </div>
+              )}
+
+              {autoplayBlocked ? (
+                <div className="player-overlay">
+                  <strong>系统拦截了自动播放</strong>
+                  <p>手动点一次播放键，后续同步控制会继续生效。</p>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="meta-grid">
+              <article className="meta-card">
+                <span>当前片源</span>
+                <strong>{room?.media?.name ?? (selectedFileName || '未选择')}</strong>
+                <p>
+                  {room?.media
+                    ? `${formatBytes(room.media.size)} · ${formatDuration(
+                        room.media.duration ?? 0,
+                      )}`
+                    : uploadLabel}
+                </p>
+              </article>
+
+              <article className="meta-card">
+                <span>当前字幕</span>
+                <strong>{room?.subtitle?.name ?? (selectedSubtitleName || '未上传')}</strong>
+                <p>
+                  {subtitleStatus === 'uploading'
+                    ? '正在同步字幕文件'
+                    : subtitleLabel}
+                </p>
+              </article>
+
+              <article className="meta-card">
+                <span>同步进度</span>
+                <strong>{formatDuration(playbackPosition)}</strong>
+                <p>
+                  {playback?.playbackState.paused
+                    ? '当前为暂停状态'
+                    : '正在沿着同一条时间轴播放'}
+                </p>
+              </article>
+            </div>
+
+            {isHost ? (
+              <div className="progress-block">
                 <div className="progress__track">
                   <div
                     className="progress__fill"
@@ -970,190 +1355,8 @@ function App() {
                   <strong>{uploadStatus === 'idle' ? '--' : `${uploadProgress}%`}</strong>
                 </div>
               </div>
-            </div>
-          ) : null}
-
-          <div className="panel-block">
-            <div className="panel-block__title">
-              <h3>成员状态</h3>
-              <StatusPill tone="neutral">
-                {room ? `${room.members.length} 在线` : '未入房'}
-              </StatusPill>
-            </div>
-
-            <div className="member-list">
-              {room?.members.length ? (
-                room.members.map((member) => (
-                  <article className="member-card" key={member.socketId}>
-                    <div>
-                      <strong>{member.nickname}</strong>
-                      <p>{member.isHost ? '房主' : '观影方'}</p>
-                    </div>
-                    <div className="member-card__tags">
-                      <StatusPill tone={member.buffering ? 'warning' : 'success'}>
-                        {member.buffering ? '缓冲中' : '已就绪'}
-                      </StatusPill>
-                    </div>
-                  </article>
-                ))
-              ) : (
-                <p className="hint">还没有房间成员。</p>
-              )}
-            </div>
-          </div>
-
-          {room && isHost ? (
-            <div className="panel-block">
-              <div className="panel-block__title">
-                <h3>同步策略</h3>
-                <StatusPill tone="accent">{syncModeLabel}</StatusPill>
-              </div>
-
-              <div className="actions actions--tight">
-                <button
-                  className={`button ${
-                    syncMode === 'soft' ? 'button--primary' : 'button--secondary'
-                  }`}
-                  onClick={() => {
-                    socketRef.current?.emit('room:config', {
-                      roomId: room.roomId,
-                      syncMode: 'soft' as SyncMode,
-                    })
-                  }}
-                >
-                  柔性同步
-                </button>
-                <button
-                  className={`button ${
-                    syncMode === 'strict'
-                      ? 'button--primary'
-                      : 'button--secondary'
-                  }`}
-                  onClick={() => {
-                    socketRef.current?.emit('room:config', {
-                      roomId: room.roomId,
-                      syncMode: 'strict' as SyncMode,
-                    })
-                  }}
-                >
-                  严格同步
-                </button>
-              </div>
-
-              <p className="hint">
-                柔性同步会让缓冲方自行追帧；严格同步会在任一方卡顿时暂停全房间，等双方都恢复后再一起继续。
-              </p>
-            </div>
-          ) : null}
-
-          {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
-        </section>
-
-        <section className="panel panel--player">
-          <div className="panel__header">
-            <div>
-              <p className="panel__eyebrow">Cinema</p>
-              <h2>同步播放器</h2>
-            </div>
-            <div className="player-badges">
-              <StatusPill tone={room?.media ? 'success' : 'neutral'}>
-                {room?.media ? '片源已挂载' : '等待房主导入'}
-              </StatusPill>
-              <StatusPill tone={localBuffering ? 'warning' : 'accent'}>
-                {localBuffering ? '本地缓冲中' : '直连链路稳定'}
-              </StatusPill>
-            </div>
-          </div>
-
-          <div className="player-frame">
-            {mediaUrl ? (
-              <video
-                key={room?.media?.id ?? 'empty'}
-                ref={videoRef}
-                className="video"
-                src={mediaUrl}
-                controls
-                playsInline
-                preload="auto"
-                onPlay={() => {
-                  setAutoplayBlocked(false)
-                  publishPlaybackIntent('user')
-                }}
-                onPause={() => publishPlaybackIntent('user')}
-                onSeeked={() => publishPlaybackIntent('user')}
-                onRateChange={() => publishPlaybackIntent('user')}
-                onLoadedMetadata={() => {
-                  const pending = pendingPlaybackRef.current ?? playback
-
-                  if (pending) {
-                    applyRemotePlayback(pending)
-                  }
-                }}
-                onWaiting={() => publishBufferState(true)}
-                onStalled={() => publishBufferState(true)}
-                onCanPlay={() => {
-                  if (localBufferingRef.current) {
-                    publishBufferState(false)
-                  }
-                }}
-                onPlaying={() => {
-                  setAutoplayBlocked(false)
-
-                  if (localBufferingRef.current) {
-                    publishBufferState(false)
-                    requestFreshPlaybackState()
-                  }
-                }}
-                onEnded={() => publishPlaybackIntent('user')}
-              />
-            ) : (
-              <div className="video video--placeholder">
-                <div>
-                  <p>还没有共享视频</p>
-                  <strong>房主导入后，另一端会直接从房主设备拉取同一份片源。</strong>
-                </div>
-              </div>
-            )}
-
-            {autoplayBlocked ? (
-              <div className="player-overlay">
-                <strong>系统拦截了自动播放</strong>
-                <p>点一下播放器的播放键，之后同步控制会继续生效。</p>
-              </div>
             ) : null}
-          </div>
-
-          <div className="media-meta">
-            <article className="meta-card">
-              <span>当前片源</span>
-              <strong>{room?.media?.name ?? '未导入'}</strong>
-              <p>
-                {room?.media
-                  ? `${formatBytes(room.media.size)} · ${formatDuration(
-                      room.media.duration ?? 0,
-                    )}`
-                  : '等待房主挂载本地视频'}
-              </p>
-            </article>
-            <article className="meta-card">
-              <span>目标进度</span>
-              <strong>{formatDuration(playbackPosition)}</strong>
-              <p>
-                {playback?.playbackState.paused
-                  ? '当前为暂停态'
-                  : '正在按房主时间轴推进'}
-              </p>
-            </article>
-            <article className="meta-card">
-              <span>直连信息</span>
-              <strong>{shareUrl || serverUrl || '待连接'}</strong>
-              <p>
-                {isHost
-                  ? '对端会直接连接你的设备'
-                  : '当前直接连接房主设备，不经过第三方中转'}
-              </p>
-            </article>
-          </div>
+          </section>
         </section>
       </main>
     </div>
