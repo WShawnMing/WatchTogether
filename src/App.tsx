@@ -7,7 +7,9 @@ import {
   useState,
 } from 'react'
 import ASSRenderer from 'assjs'
+import Plyr from 'plyr'
 import { io, type Socket } from 'socket.io-client'
+import 'plyr/dist/plyr.css'
 import './App.css'
 import {
   createRoomCode,
@@ -121,15 +123,26 @@ function formatPresenceSummary(names: string[], verb: '加入' | '离开') {
   return `${names[0]}、${names[1]} 等 ${names.length} 人${verb}了房间`
 }
 
-function isTypingTarget(target: EventTarget | null) {
+function isTextEntryTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) {
     return false
   }
 
-  return (
-    target.isContentEditable ||
-    ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
-  )
+  if (target.isContentEditable) {
+    return true
+  }
+
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+    return true
+  }
+
+  if (target instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'file', 'radio', 'range', 'reset', 'submit'].includes(
+      target.type.toLowerCase(),
+    )
+  }
+
+  return false
 }
 
 function buildMediaUrl(serverUrl: string, roomId: string, mediaId: string) {
@@ -269,28 +282,22 @@ function App() {
   const [subtitleScale, setSubtitleScale] = useState(1)
   const [subtitleOffsetY, setSubtitleOffsetY] = useState(0)
   const [subtitlePanelOpen, setSubtitlePanelOpen] = useState(false)
-  const [videoDurationValue, setVideoDurationValue] = useState(0)
-  const [videoCurrentTime, setVideoCurrentTime] = useState(0)
-  const [videoPaused, setVideoPaused] = useState(true)
-  const [isScrubbing, setIsScrubbing] = useState(false)
-  const [scrubValue, setScrubValue] = useState(0)
-  const [isFullscreen, setIsFullscreen] = useState(false)
-  const [isMuted, setIsMuted] = useState(false)
-  const [showPlayerControls, setShowPlayerControls] = useState(true)
   const [presenceToasts, setPresenceToasts] = useState<PresenceToast[]>([])
 
+  const plyrRef = useRef<Plyr | null>(null)
   const socketRef = useRef<Socket | null>(null)
   const roomRef = useRef<RoomSnapshot | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const playerFrameRef = useRef<HTMLDivElement | null>(null)
+  const subtitleMenuRef = useRef<HTMLDivElement | null>(null)
   const subtitleLayerRef = useRef<HTMLDivElement | null>(null)
   const assRendererRef = useRef<ASSRenderer | null>(null)
   const joinPayloadRef = useRef<JoinRoomPayload | null>(null)
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
   const suppressEventsRef = useRef(false)
   const suppressTimeoutRef = useRef<number | null>(null)
-  const controlsHideTimeoutRef = useRef<number | null>(null)
   const localBufferingRef = useRef(false)
+  const localUserActionUntilRef = useRef(0)
   const manualDisconnectRef = useRef(false)
   const toastTimersRef = useRef<Map<string, number>>(new Map())
   const memberPresencePrimedRef = useRef(false)
@@ -314,8 +321,6 @@ function App() {
   const playbackPosition = playback
     ? deriveCurrentPosition(playback.playbackState, playback.serverTime)
     : 0
-  const effectiveDuration = Math.max(videoDurationValue || room?.media?.duration || 0, 0)
-  const displayedCurrentTime = Math.min(isScrubbing ? scrubValue : videoCurrentTime, effectiveDuration || Number.MAX_SAFE_INTEGER)
   const connectionLabel = getConnectionLabel(
     connectionState,
     relayStatus.running,
@@ -340,20 +345,6 @@ function App() {
   const mediaButtonMeta = selectedFileName || room?.media?.name || 'MP4 / MKV / MOV'
   const subtitleButtonMeta =
     selectedSubtitleName || room?.subtitle?.name || '.srt / .vtt / .ass'
-  const seekFillPercentage =
-    effectiveDuration > 0
-      ? Math.max(
-          0,
-          Math.min((displayedCurrentTime / effectiveDuration) * 100, 100),
-        )
-      : 0
-  const playerControlsVisible =
-    !isFullscreen ||
-    showPlayerControls ||
-    subtitlePanelOpen ||
-    isScrubbing ||
-    videoPaused ||
-    autoplayBlocked
 
   useEffect(() => {
     roomRef.current = room
@@ -501,43 +492,6 @@ function App() {
     }, duration)
   }, [])
 
-  const clearPlayerControlsHideTimer = useCallback(() => {
-    if (controlsHideTimeoutRef.current !== null) {
-      window.clearTimeout(controlsHideTimeoutRef.current)
-      controlsHideTimeoutRef.current = null
-    }
-  }, [])
-
-  const revealPlayerControls = useCallback(
-    (delay = 2_200) => {
-      setShowPlayerControls(true)
-      clearPlayerControlsHideTimer()
-
-      if (
-        !isFullscreen ||
-        subtitlePanelOpen ||
-        isScrubbing ||
-        videoPaused ||
-        autoplayBlocked
-      ) {
-        return
-      }
-
-      controlsHideTimeoutRef.current = window.setTimeout(() => {
-        setShowPlayerControls(false)
-        controlsHideTimeoutRef.current = null
-      }, delay)
-    },
-    [
-      autoplayBlocked,
-      clearPlayerControlsHideTimer,
-      isFullscreen,
-      isScrubbing,
-      subtitlePanelOpen,
-      videoPaused,
-    ],
-  )
-
   const applyRemotePlayback = useCallback(
     (incoming: PlaybackEnvelope) => {
       const video = videoRef.current
@@ -549,6 +503,15 @@ function App() {
 
       if (video.readyState < 1) {
         pendingPlaybackRef.current = incoming
+        return
+      }
+
+      if (
+        socketId &&
+        incoming.playbackState.reason === 'user' &&
+        incoming.playbackState.updatedBy === socketId &&
+        Date.now() < localUserActionUntilRef.current
+      ) {
         return
       }
 
@@ -604,7 +567,7 @@ function App() {
         })
       }
     },
-    [suppressLocalPlaybackEvents],
+    [socketId, suppressLocalPlaybackEvents],
   )
 
   useEffect(() => {
@@ -614,162 +577,158 @@ function App() {
   }, [applyRemotePlayback, playback, room?.media])
 
   useEffect(() => {
-    const onFullscreenChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement))
-    }
-
-    document.addEventListener('fullscreenchange', onFullscreenChange)
-
-    return () => {
-      document.removeEventListener('fullscreenchange', onFullscreenChange)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!mediaUrl) {
-      clearPlayerControlsHideTimer()
-      setShowPlayerControls(true)
-      return
-    }
-
-    if (
-      !isFullscreen ||
-      subtitlePanelOpen ||
-      isScrubbing ||
-      videoPaused ||
-      autoplayBlocked
-    ) {
-      clearPlayerControlsHideTimer()
-      setShowPlayerControls(true)
-      return
-    }
-
-    revealPlayerControls()
-  }, [
-    autoplayBlocked,
-    clearPlayerControlsHideTimer,
-    isFullscreen,
-    isScrubbing,
-    mediaUrl,
-    revealPlayerControls,
-    subtitlePanelOpen,
-    videoPaused,
-  ])
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!mediaUrl || event.metaKey || event.ctrlKey || event.altKey) {
-        return
-      }
-
-      if (isTypingTarget(event.target)) {
-        return
-      }
-
-      const video = videoRef.current
-
-      if (!video) {
-        return
-      }
-
-      const key = event.key.toLowerCase()
-
-      if (key === ' ' || key === 'k') {
-        event.preventDefault()
-        revealPlayerControls()
-        if (video.paused) {
-          void video.play().then(
-            () => {
-              setAutoplayBlocked(false)
-            },
-            () => {
-              setAutoplayBlocked(true)
-            },
-          )
-        } else {
-          video.pause()
-        }
-        return
-      }
-
-      if (key === 'f') {
-        event.preventDefault()
-        revealPlayerControls()
-        const playerFrame = playerFrameRef.current
-
-        if (!playerFrame) {
-          return
-        }
-
-        void (document.fullscreenElement
-          ? document.exitFullscreen()
-          : playerFrame.requestFullscreen())
-          .then(() => {
-            playerFrame.focus()
-          })
-          .catch(() => {
-            setErrorMessage('切换全屏失败')
-          })
-        return
-      }
-
-      if (key === 'm') {
-        event.preventDefault()
-        revealPlayerControls()
-        video.muted = !video.muted
-        setIsMuted(video.muted)
-        return
-      }
-
-      if (key === 'arrowleft' || key === 'j') {
-        event.preventDefault()
-        revealPlayerControls()
-        const delta = key === 'j' ? -10 : -5
-        video.currentTime = Math.max(0, video.currentTime + delta)
-        setVideoCurrentTime(video.currentTime)
-        publishPlaybackIntent('user')
-        return
-      }
-
-      if (key === 'arrowright' || key === 'l') {
-        event.preventDefault()
-        revealPlayerControls()
-        const duration = Number.isFinite(video.duration)
-          ? video.duration
-          : effectiveDuration
-        const delta = key === 'l' ? 10 : 5
-        video.currentTime = Math.min(duration || video.currentTime + delta, video.currentTime + delta)
-        setVideoCurrentTime(video.currentTime)
-        publishPlaybackIntent('user')
-        return
-      }
-
-      if (key === 'arrowup' || key === 'arrowdown') {
-        event.preventDefault()
-        revealPlayerControls()
-        const delta = key === 'arrowup' ? 0.05 : -0.05
-        const nextVolume = Math.max(0, Math.min(1, video.volume + delta))
-        video.muted = false
-        video.volume = nextVolume
-        if (nextVolume === 0) {
-          video.muted = true
-        }
-        setIsMuted(video.muted || nextVolume === 0)
-      }
-    }
-
-    window.addEventListener('keydown', onKeyDown)
-
-    return () => {
-      window.removeEventListener('keydown', onKeyDown)
-    }
-  }, [effectiveDuration, mediaUrl, revealPlayerControls])
-
-  useEffect(() => {
-    if (!room?.subtitle) {
+    if (!room?.subtitle || subtitleFormat !== 'ass') {
       setSubtitlePanelOpen(false)
     }
-  }, [room?.subtitle])
+  }, [room?.subtitle, subtitleFormat])
+
+  useEffect(() => {
+    if (!subtitlePanelOpen) {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const menu = subtitleMenuRef.current
+
+      if (menu && event.target instanceof Node && !menu.contains(event.target)) {
+        setSubtitlePanelOpen(false)
+      }
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [subtitlePanelOpen])
+
+  useEffect(() => {
+    const video = videoRef.current
+
+    plyrRef.current?.destroy()
+    plyrRef.current = null
+
+    if (!video || !mediaUrl) {
+      return
+    }
+
+    const player = new Plyr(video, {
+      controls: [
+        'play-large',
+        'play',
+        'progress',
+        'current-time',
+        'duration',
+        'mute',
+        'volume',
+        'captions',
+        'settings',
+        'fullscreen',
+      ],
+      settings: subtitleFormat === 'vtt' ? ['captions', 'speed'] : ['speed'],
+      captions: {
+        active: subtitleFormat === 'vtt',
+        language: room?.subtitle?.language ?? 'auto',
+        update: true,
+      },
+      clickToPlay: true,
+      disableContextMenu: true,
+      displayDuration: true,
+      fullscreen: {
+        enabled: true,
+        fallback: true,
+        iosNative: false,
+        container: '.player-frame',
+      },
+      hideControls: true,
+      keyboard: {
+        focused: true,
+        global: true,
+      },
+      seekTime: 5,
+      tooltips: {
+        controls: true,
+        seek: true,
+      },
+    })
+
+    plyrRef.current = player
+
+    return () => {
+      player.destroy()
+
+      if (plyrRef.current === player) {
+        plyrRef.current = null
+      }
+    }
+  }, [mediaUrl, room?.subtitle?.language, subtitleFormat, videoKey])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const player = plyrRef.current
+      const target = event.target instanceof HTMLElement ? event.target : null
+
+      if (!player || !mediaUrl || event.metaKey || event.ctrlKey || event.altKey) {
+        return
+      }
+
+      if (target?.closest('.subtitle-popover')) {
+        return
+      }
+
+      if (isTextEntryTarget(target)) {
+        return
+      }
+
+      switch (event.key.toLowerCase()) {
+        case ' ':
+        case 'k':
+          event.preventDefault()
+          void player.togglePlay()
+          break
+        case 'j':
+          event.preventDefault()
+          player.rewind(10)
+          break
+        case 'l':
+          event.preventDefault()
+          player.forward(10)
+          break
+        case 'arrowleft':
+          event.preventDefault()
+          player.rewind(5)
+          break
+        case 'arrowright':
+          event.preventDefault()
+          player.forward(5)
+          break
+        case 'arrowup':
+          event.preventDefault()
+          player.increaseVolume(0.1)
+          break
+        case 'arrowdown':
+          event.preventDefault()
+          player.decreaseVolume(0.1)
+          break
+        case 'm':
+          event.preventDefault()
+          player.muted = !player.muted
+          break
+        case 'f':
+          event.preventDefault()
+          player.fullscreen.toggle()
+          break
+        default:
+          break
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [mediaUrl])
 
   useEffect(() => {
     assRendererRef.current?.destroy()
@@ -840,16 +799,13 @@ function App() {
         window.clearTimeout(suppressTimeoutRef.current)
       }
 
-      if (controlsHideTimeoutRef.current !== null) {
-        window.clearTimeout(controlsHideTimeoutRef.current)
-      }
-
       for (const timer of toastTimers.values()) {
         window.clearTimeout(timer)
       }
 
       toastTimers.clear()
 
+      plyrRef.current?.destroy()
       assRendererRef.current?.destroy()
       void window.desktopApp?.discovery?.advertise(null)
       socketRef.current?.disconnect()
@@ -866,11 +822,7 @@ function App() {
       setLocalBuffering(false)
       localBufferingRef.current = false
       pendingPlaybackRef.current = null
-      setVideoCurrentTime(0)
-      setVideoDurationValue(0)
-      setVideoPaused(true)
-      setScrubValue(0)
-      setIsScrubbing(false)
+      localUserActionUntilRef.current = 0
     }
 
     if (
@@ -967,6 +919,10 @@ function App() {
       return
     }
 
+    if (reason === 'user') {
+      localUserActionUntilRef.current = Date.now() + 1_500
+    }
+
     socket.emit('playback:control', {
       roomId: currentRoom.roomId,
       position: video.currentTime,
@@ -1048,6 +1004,7 @@ function App() {
     setErrorMessage(null)
     manualDisconnectRef.current = false
 
+    await notifyLeaveRoom()
     socketRef.current?.removeAllListeners()
     socketRef.current?.disconnect()
 
@@ -1164,6 +1121,7 @@ function App() {
     joinPayloadRef.current = null
     pendingPlaybackRef.current = null
     localBufferingRef.current = false
+    localUserActionUntilRef.current = 0
     memberPresencePrimedRef.current = false
     roomRef.current = null
     setSocketId('')
@@ -1189,6 +1147,23 @@ function App() {
     socketRef.current?.removeAllListeners()
     socketRef.current?.disconnect()
     socketRef.current = null
+  }
+
+  const notifyLeaveRoom = async () => {
+    const socket = socketRef.current
+    const currentRoom = roomRef.current
+
+    if (!socket || !currentRoom || !socket.connected) {
+      return
+    }
+
+    try {
+      await socket.timeout(400).emitWithAck('room:leave', {
+        roomId: currentRoom.roomId,
+      })
+    } catch {
+      // The disconnect event remains the fallback.
+    }
   }
 
   const startSharing = async () => {
@@ -1220,6 +1195,7 @@ function App() {
     setErrorMessage(null)
 
     try {
+      await notifyLeaveRoom()
       disconnectFromRoom()
       await window.desktopApp.discovery.advertise(null)
       await window.desktopApp.relay.stop()
@@ -1238,11 +1214,18 @@ function App() {
       return
     }
 
-    disconnectFromRoom()
+    void notifyLeaveRoom().finally(() => {
+      disconnectFromRoom()
+    })
   }
 
   const joinDiscoveredRoom = async (session: DiscoverySession) => {
     const sessionKey = `${session.instanceId}:${session.roomId}`
+    const currentRoomId = roomRef.current?.roomId ?? ''
+
+    if (currentRoomId && currentRoomId === session.roomId) {
+      return
+    }
 
     setJoiningRoomId(sessionKey)
     setErrorMessage(null)
@@ -1380,74 +1363,6 @@ function App() {
     }
   }
 
-  const togglePlayback = useCallback(async () => {
-    const video = videoRef.current
-
-    if (!video) {
-      return
-    }
-
-    if (video.paused) {
-      try {
-        await video.play()
-        setAutoplayBlocked(false)
-      } catch {
-        setAutoplayBlocked(true)
-      }
-
-      return
-    }
-
-    video.pause()
-  }, [])
-
-  const toggleMute = useCallback(() => {
-    const video = videoRef.current
-
-    if (!video) {
-      return
-    }
-
-    revealPlayerControls()
-    video.muted = !video.muted
-    setIsMuted(video.muted)
-  }, [revealPlayerControls])
-
-  const toggleFullscreen = useCallback(async () => {
-    const playerFrame = playerFrameRef.current
-
-    if (!playerFrame) {
-      return
-    }
-
-    try {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen()
-      } else {
-        await playerFrame.requestFullscreen()
-      }
-      playerFrame.focus()
-      revealPlayerControls()
-    } catch {
-      setErrorMessage('切换全屏失败')
-    }
-  }, [revealPlayerControls])
-
-  const handleSeekChange = (nextValue: number) => {
-    const video = videoRef.current
-
-    setIsScrubbing(true)
-    setScrubValue(nextValue)
-    setVideoCurrentTime(nextValue)
-    revealPlayerControls()
-
-    if (!video) {
-      return
-    }
-
-    video.currentTime = nextValue
-  }
-
   return (
     <div className="app-shell">
       {presenceToasts.length ? (
@@ -1560,6 +1475,13 @@ function App() {
               {discoveredSessions.length ? (
                 discoveredSessions.map((session) => {
                   const sessionKey = `${session.instanceId}:${session.roomId}`
+                  const isCurrentSession =
+                    room?.roomId === session.roomId && connectionState !== 'idle'
+                  const joinButtonLabel = isCurrentSession
+                    ? '已在房间中'
+                    : joiningRoomId === sessionKey
+                      ? '加入中...'
+                      : '加入观看'
 
                   return (
                     <article className="session-card" key={sessionKey}>
@@ -1612,9 +1534,9 @@ function App() {
                         <button
                           className="button button--secondary"
                           onClick={() => void joinDiscoveredRoom(session)}
-                          disabled={joiningRoomId === sessionKey}
+                          disabled={joiningRoomId === sessionKey || isCurrentSession}
                         >
-                          {joiningRoomId === sessionKey ? '加入中...' : '加入观看'}
+                          {joinButtonLabel}
                         </button>
                       </div>
                     </article>
@@ -1800,37 +1722,15 @@ function App() {
               <p className="support-note">{formatSupportHint(room?.media?.name)}</p>
             )}
 
-            <div
-              className={`player-frame ${
-                isFullscreen ? 'player-frame--fullscreen' : ''
-              } ${
-                playerControlsVisible ? '' : 'player-frame--controls-hidden'
-              }`}
-              ref={playerFrameRef}
-              onFocus={() => {
-                revealPlayerControls()
-              }}
-              onMouseMove={() => {
-                revealPlayerControls()
-              }}
-              onMouseLeave={() => {
-                if (isFullscreen && !videoPaused && !subtitlePanelOpen && !isScrubbing) {
-                  clearPlayerControlsHideTimer()
-                  setShowPlayerControls(false)
-                }
-              }}
-              onMouseDown={() => {
-                playerFrameRef.current?.focus()
-                revealPlayerControls()
-              }}
-              tabIndex={0}
-            >
+            <div className="player-frame" ref={playerFrameRef}>
               <div className="player-stage">
                 {mediaUrl ? (
                   <video
                     key={videoKey}
                     ref={videoRef}
                     className="video"
+                    controls
+                    controlsList="nodownload noremoteplayback"
                     src={mediaUrl}
                     disablePictureInPicture
                     disableRemotePlayback
@@ -1841,27 +1741,18 @@ function App() {
                     }}
                     onPlay={() => {
                       setAutoplayBlocked(false)
-                      setVideoPaused(false)
                       publishPlaybackIntent('user')
                     }}
                     onPause={() => {
-                      setVideoPaused(true)
                       publishPlaybackIntent('user')
+                    }}
+                    onSeeking={() => {
+                      localUserActionUntilRef.current = Date.now() + 1500
                     }}
                     onSeeked={() => publishPlaybackIntent('user')}
                     onRateChange={() => publishPlaybackIntent('user')}
                     onLoadedMetadata={() => {
-                      const video = videoRef.current
                       const pending = pendingPlaybackRef.current ?? playback
-
-                      if (video) {
-                        setVideoDurationValue(
-                          Number.isFinite(video.duration) ? video.duration : 0,
-                        )
-                        setVideoCurrentTime(video.currentTime)
-                        setIsMuted(video.muted)
-                        setVideoPaused(video.paused)
-                      }
 
                       if (pending) {
                         applyRemotePlayback(pending)
@@ -1876,33 +1767,6 @@ function App() {
 
                       if (video.currentTime === 0) {
                         video.currentTime = 0.001
-                      }
-
-                      setVideoCurrentTime(video.currentTime)
-                    }}
-                    onDurationChange={() => {
-                      const video = videoRef.current
-
-                      if (video) {
-                        setVideoDurationValue(
-                          Number.isFinite(video.duration) ? video.duration : 0,
-                        )
-                      }
-                    }}
-                    onTimeUpdate={() => {
-                      const video = videoRef.current
-
-                      if (!video || isScrubbing) {
-                        return
-                      }
-
-                      setVideoCurrentTime(video.currentTime)
-                    }}
-                    onVolumeChange={() => {
-                      const video = videoRef.current
-
-                      if (video) {
-                        setIsMuted(video.muted || video.volume === 0)
                       }
                     }}
                     onWaiting={() => publishBufferState(true)}
@@ -1959,6 +1823,82 @@ function App() {
                   }
                 />
 
+                {subtitleFormat === 'ass' ? (
+                  <div className="player-floating-actions">
+                    <div className="player-subtitle-menu" ref={subtitleMenuRef}>
+                      <button
+                        className={`player-subtitle-button ${
+                          subtitlePanelOpen ? 'player-subtitle-button--active' : ''
+                        }`}
+                        onClick={() => {
+                          setSubtitlePanelOpen((current) => !current)
+                        }}
+                        type="button"
+                      >
+                        字幕
+                      </button>
+
+                      {subtitlePanelOpen ? (
+                        <div className="subtitle-popover subtitle-popover--floating">
+                          <div className="subtitle-popover__header">
+                            <strong>字幕</strong>
+                            <span>ASS 渲染</span>
+                          </div>
+
+                          <label className="subtitle-control">
+                            <span>字号</span>
+                            <input
+                              type="range"
+                              min="0.7"
+                              max="1.6"
+                              step="0.05"
+                              value={subtitleScale}
+                              onChange={(event) => {
+                                setSubtitleScale(Number(event.target.value))
+                              }}
+                            />
+                            <strong>{Math.round(subtitleScale * 100)}%</strong>
+                          </label>
+
+                          <label className="subtitle-control">
+                            <span>位置</span>
+                            <input
+                              type="range"
+                              min="-120"
+                              max="120"
+                              step="4"
+                              value={subtitleOffsetY}
+                              onChange={(event) => {
+                                setSubtitleOffsetY(Number(event.target.value))
+                              }}
+                            />
+                            <strong>
+                              {subtitleOffsetY > 0
+                                ? `+${subtitleOffsetY}`
+                                : subtitleOffsetY}
+                              px
+                            </strong>
+                          </label>
+
+                          <div className="subtitle-popover__footer">
+                            <p>支持实时调整字号和上下位置。</p>
+                            <button
+                              className="button button--secondary"
+                              onClick={() => {
+                                setSubtitleScale(1)
+                                setSubtitleOffsetY(0)
+                              }}
+                              type="button"
+                            >
+                              重置
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
                 {autoplayBlocked ? (
                   <div className="player-overlay">
                     <strong>系统拦截了自动播放</strong>
@@ -1966,161 +1906,6 @@ function App() {
                   </div>
                 ) : null}
               </div>
-
-              {mediaUrl ? (
-                <div className="player-controls">
-                  <button
-                    className="player-controls__button"
-                    onClick={() => {
-                      void togglePlayback()
-                    }}
-                    type="button"
-                  >
-                    {videoPaused ? '播放' : '暂停'}
-                  </button>
-
-                  <div className="player-controls__time">
-                    {formatDuration(displayedCurrentTime)} /{' '}
-                    {formatDuration(effectiveDuration)}
-                  </div>
-
-                  <input
-                    className="player-controls__seek"
-                    type="range"
-                    min="0"
-                    max={Math.max(effectiveDuration, 0.1)}
-                    step="0.1"
-                    style={
-                      {
-                        '--seek-fill': `${seekFillPercentage}%`,
-                      } as CSSProperties
-                    }
-                    value={displayedCurrentTime}
-                    onMouseDown={() => {
-                      setIsScrubbing(true)
-                    }}
-                    onMouseUp={() => {
-                      setIsScrubbing(false)
-                    }}
-                    onTouchStart={() => {
-                      setIsScrubbing(true)
-                    }}
-                    onTouchEnd={() => {
-                      setIsScrubbing(false)
-                    }}
-                    onChange={(event) => {
-                      handleSeekChange(Number(event.target.value))
-                    }}
-                  />
-
-                  <div className="player-controls__actions">
-                    <button
-                      className="player-controls__icon"
-                      onClick={toggleMute}
-                      type="button"
-                    >
-                      {isMuted ? '取消静音' : '静音'}
-                    </button>
-
-                    {room?.subtitle ? (
-                      <div className="player-controls__menu">
-                        <button
-                          className={`player-controls__icon ${
-                            subtitlePanelOpen
-                              ? 'player-controls__icon--active'
-                              : ''
-                          }`}
-                          onClick={() => {
-                            setSubtitlePanelOpen((current) => !current)
-                          }}
-                          type="button"
-                        >
-                          选项
-                        </button>
-
-                        {subtitlePanelOpen ? (
-                          <div className="subtitle-popover">
-                            <div className="subtitle-popover__header">
-                              <strong>字幕</strong>
-                              <span>
-                                {subtitleFormat === 'ass'
-                                  ? 'ASS 渲染'
-                                  : '原生字幕'}
-                              </span>
-                            </div>
-
-                            <label className="subtitle-control">
-                              <span>字号</span>
-                              <input
-                                type="range"
-                                min="0.7"
-                                max="1.6"
-                                step="0.05"
-                                value={subtitleScale}
-                                onChange={(event) => {
-                                  setSubtitleScale(Number(event.target.value))
-                                }}
-                                disabled={subtitleFormat !== 'ass'}
-                              />
-                              <strong>{Math.round(subtitleScale * 100)}%</strong>
-                            </label>
-
-                            <label className="subtitle-control">
-                              <span>位置</span>
-                              <input
-                                type="range"
-                                min="-120"
-                                max="120"
-                                step="4"
-                                value={subtitleOffsetY}
-                                onChange={(event) => {
-                                  setSubtitleOffsetY(Number(event.target.value))
-                                }}
-                                disabled={subtitleFormat !== 'ass'}
-                              />
-                              <strong>
-                                {subtitleOffsetY > 0
-                                  ? `+${subtitleOffsetY}`
-                                  : subtitleOffsetY}
-                                px
-                              </strong>
-                            </label>
-
-                            <div className="subtitle-popover__footer">
-                              <p>
-                                {subtitleFormat === 'ass'
-                                  ? '可直接调节字号和上下位置。'
-                                  : '原生字幕目前不开放细粒度样式调节。'}
-                              </p>
-                              <button
-                                className="button button--secondary"
-                                onClick={() => {
-                                  setSubtitleScale(1)
-                                  setSubtitleOffsetY(0)
-                                }}
-                                disabled={subtitleFormat !== 'ass'}
-                                type="button"
-                              >
-                                重置
-                              </button>
-                            </div>
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-
-                    <button
-                      className="player-controls__icon"
-                      onClick={() => {
-                        void toggleFullscreen()
-                      }}
-                      type="button"
-                    >
-                      {isFullscreen ? '退出全屏' : '全屏'}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
             </div>
 
             <div className="meta-grid">

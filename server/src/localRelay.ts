@@ -387,6 +387,33 @@ export async function startLocalRelay(
     io.to(room.id).emit('playback:state', payload)
   }
 
+  function removeMemberFromRoom(socketId: string) {
+    const roomId = socketToRoom.get(socketId)
+
+    if (!roomId) {
+      return
+    }
+
+    socketToRoom.delete(socketId)
+
+    const room = rooms.get(roomId)
+
+    if (!room) {
+      return
+    }
+
+    room.members.delete(socketId)
+    room.lastActiveAt = Date.now()
+    reassignHostIfNeeded(room)
+
+    if (room.members.size === 0) {
+      return
+    }
+
+    emitRoomSnapshot(io, room)
+    applyBuffering(io, room)
+  }
+
   function applyBuffering(io: Server, room: RoomState) {
     if (room.syncMode !== 'strict') {
       room.resumeAfterBuffer = false
@@ -861,31 +888,25 @@ export async function startLocalRelay(
       emitPlaybackState(io, room)
     })
 
+    socket.on(
+      'room:leave',
+      (
+        payload: { roomId?: string } | undefined,
+        callback?: (result: { ok: boolean }) => void,
+      ) => {
+        const roomId = socketToRoom.get(socket.id)
+        const requestedRoomId = normalizeRoomId(payload?.roomId ?? '')
+
+        if (roomId && (!requestedRoomId || requestedRoomId === roomId)) {
+          removeMemberFromRoom(socket.id)
+        }
+
+        callback?.({ ok: true })
+      },
+    )
+
     socket.on('disconnect', () => {
-      const roomId = socketToRoom.get(socket.id)
-
-      if (!roomId) {
-        return
-      }
-
-      socketToRoom.delete(socket.id)
-
-      const room = rooms.get(roomId)
-
-      if (!room) {
-        return
-      }
-
-      room.members.delete(socket.id)
-      room.lastActiveAt = Date.now()
-      reassignHostIfNeeded(room)
-
-      if (room.members.size === 0) {
-        return
-      }
-
-      emitRoomSnapshot(io, room)
-      applyBuffering(io, room)
+      removeMemberFromRoom(socket.id)
     })
   })
 

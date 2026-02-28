@@ -20,6 +20,7 @@ const DISCOVERY_TTL_MS = 4_500
 const DISCOVERY_PROBE_CACHE_MS = 8_000
 const DISCOVERY_PROBE_TIMEOUT_MS = 450
 const DISCOVERY_PROBE_CONCURRENCY = 24
+const DISCOVERY_MAX_PROBE_HOSTS = 2_048
 const APP_DISPLAY_NAME = 'WatchTogether'
 
 process.env.WS_NO_BUFFER_UTIL = '1'
@@ -140,6 +141,16 @@ function prefixLengthFromNetmask(netmask: string) {
     .length
 }
 
+function getProbeMask(prefix: number, netmask: string) {
+  const hostCount = Math.max(0, 2 ** Math.max(0, 32 - prefix) - 2)
+
+  if (prefix >= 20 && prefix <= 30 && hostCount <= DISCOVERY_MAX_PROBE_HOSTS) {
+    return ipToInt(netmask)
+  }
+
+  return 0xffffff00
+}
+
 function getProbeAddresses() {
   const addresses = new Set<string>()
   const localAddresses = new Set<string>()
@@ -160,9 +171,8 @@ function getProbeAddresses() {
       try {
         const host = ipToInt(address.address)
         const prefix = prefixLengthFromNetmask(address.netmask)
-        const useActualSubnet = prefix >= 24 && prefix <= 30
-        const mask = useActualSubnet ? ipToInt(address.netmask) : 0xffffff00
-        const networkBase = host & mask
+        const mask = getProbeMask(prefix, address.netmask)
+        const networkBase = (host & mask) >>> 0
         const broadcast = (networkBase | (~mask >>> 0)) >>> 0
 
         for (let candidate = networkBase + 1; candidate < broadcast; candidate += 1) {

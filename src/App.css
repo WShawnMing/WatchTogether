@@ -483,10 +483,44 @@
   box-shadow:
     0 26px 56px rgba(7, 11, 19, 0.24),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --plyr-color-main: #7da8ff;
+  --plyr-control-radius: 999px;
+  --plyr-control-spacing: 14px;
+  --plyr-control-icon-size: 17px;
+  --plyr-font-family: "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+  --plyr-focus-visible-color: #8fb3ff;
+  --plyr-menu-background: rgba(9, 15, 27, 0.96);
+  --plyr-menu-color: #f8fafc;
+  --plyr-menu-radius: 18px;
+  --plyr-menu-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
+  --plyr-range-track-height: 6px;
+  --plyr-range-thumb-height: 16px;
+  --plyr-range-thumb-background: #ffffff;
+  --plyr-range-thumb-shadow:
+    0 10px 24px rgba(61, 130, 246, 0.34),
+    0 4px 10px rgba(0, 0, 0, 0.18);
+  --plyr-tooltip-background: rgba(9, 15, 27, 0.96);
+  --plyr-tooltip-color: #f8fafc;
+  --plyr-video-control-background-hover: rgba(93, 149, 255, 0.92);
+  --plyr-video-control-color: rgba(248, 250, 252, 0.96);
+  --plyr-video-control-color-hover: #ffffff;
+  --plyr-video-controls-background:
+    linear-gradient(
+      180deg,
+      rgba(3, 7, 12, 0) 0%,
+      rgba(4, 8, 14, 0.36) 18%,
+      rgba(4, 8, 14, 0.86) 58%,
+      rgba(4, 8, 14, 0.96) 100%
+    );
+  --plyr-video-progress-buffered-background: rgba(255, 255, 255, 0.22);
+  --plyr-video-range-track-background: rgba(255, 255, 255, 0.22);
+  --plyr-captions-background: rgba(0, 0, 0, 0.7);
+  --plyr-captions-text-color: #ffffff;
 }
 
 .player-stage {
   position: relative;
+  display: flex;
   aspect-ratio: 16 / 9;
   min-height: 420px;
   background: #000;
@@ -512,118 +546,110 @@
   object-fit: contain;
 }
 
-.player-controls {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 18px;
-  padding: 16px 18px 18px;
-  background:
-    radial-gradient(circle at top, rgba(74, 136, 255, 0.16), transparent 34%),
-    linear-gradient(180deg, rgba(8, 15, 28, 0.94), rgba(6, 10, 18, 0.98));
-  transition: opacity 180ms ease, transform 180ms ease;
+.player-frame .plyr {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
 }
 
-.player-controls__button,
-.player-controls__icon {
-  min-height: 40px;
-  padding: 0 15px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #f8fafc;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    0 8px 24px rgba(0, 0, 0, 0.16);
+.player-frame .plyr__video-wrapper {
+  height: 100%;
+  background: #000;
 }
 
-.player-controls__time {
-  min-width: 96px;
+.player-frame .plyr video {
+  object-fit: contain;
+}
+
+.player-frame .plyr--video .plyr__controls {
+  padding: 18px 18px 16px;
+  gap: 4px;
+}
+
+.player-frame .plyr__controls__item.plyr__time {
+  min-width: 58px;
+  padding-inline: 10px;
   color: rgba(248, 250, 252, 0.88);
-  font-size: 0.94rem;
+  font-size: 0.92rem;
   font-variant-numeric: tabular-nums;
 }
 
-.player-controls__seek {
-  --seek-fill: 0%;
-  appearance: none;
-  width: 100%;
-  height: 6px;
-  margin: 0;
-  border-radius: 999px;
-  outline: none;
-  background: linear-gradient(
-    90deg,
-    #8db6ff 0%,
-    #5f98ff var(--seek-fill),
-    rgba(255, 255, 255, 0.18) var(--seek-fill),
-    rgba(255, 255, 255, 0.18) 100%
-  );
+.player-frame .plyr__control {
+  color: rgba(248, 250, 252, 0.96);
 }
 
-.player-controls__seek::-webkit-slider-runnable-track {
-  width: 100%;
-  height: 6px;
-  border-radius: 999px;
-  background: transparent;
-}
-
-.player-controls__seek::-webkit-slider-thumb {
-  appearance: none;
-  width: 16px;
-  height: 16px;
-  margin-top: -5px;
-  border: 2px solid rgba(8, 15, 28, 0.9);
-  border-radius: 50%;
-  background: #f8fbff;
+.player-frame .plyr--video .plyr__control:not(.plyr__control--overlaid) {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
   box-shadow:
-    0 4px 14px rgba(61, 130, 246, 0.32),
-    0 2px 6px rgba(0, 0, 0, 0.22);
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 10px 24px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(14px);
 }
 
-.player-controls__seek::-moz-range-track {
-  height: 6px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.18);
+.player-frame .plyr--video .plyr__control--overlaid {
+  box-shadow: 0 22px 52px rgba(50, 112, 220, 0.3);
 }
 
-.player-controls__seek::-moz-range-progress {
-  height: 6px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #8db6ff, #5f98ff);
+.player-frame .plyr__progress__container {
+  margin-inline: 8px;
 }
 
-.player-controls__seek::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
-  border: 2px solid rgba(8, 15, 28, 0.9);
-  border-radius: 50%;
-  background: #f8fbff;
-  box-shadow:
-    0 4px 14px rgba(61, 130, 246, 0.32),
-    0 2px 6px rgba(0, 0, 0, 0.22);
+.player-frame .plyr__progress input[type="range"] {
+  color: #7da8ff;
 }
 
-.player-controls__actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
+.player-frame .plyr__progress input[type="range"]::-webkit-slider-thumb {
+  border: 2px solid rgba(7, 12, 20, 0.94);
 }
 
-.player-controls__menu {
+.player-frame .plyr__menu__container {
+  margin-bottom: 14px;
+}
+
+.player-frame .plyr__menu__container [role="menu"] {
+  padding: 8px;
+}
+
+.player-frame .plyr__menu__container .plyr__control {
+  border-radius: 12px;
+}
+
+.player-floating-actions {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 4;
+}
+
+.player-subtitle-menu {
   position: relative;
 }
 
-.player-controls__icon--active {
-  background: rgba(61, 130, 246, 0.9);
+.player-subtitle-button {
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(9, 15, 27, 0.58);
+  color: #f8fafc;
+  font-size: 0.92rem;
+  font-weight: 600;
+  backdrop-filter: blur(16px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 14px 32px rgba(0, 0, 0, 0.2);
+}
+
+.player-subtitle-button--active,
+.player-subtitle-button:hover {
+  background: rgba(93, 149, 255, 0.92);
   border-color: transparent;
 }
 
 .subtitle-popover {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 12px);
   width: min(320px, calc(100vw - 48px));
   padding: 18px;
   border: 1px solid rgba(255, 255, 255, 0.14);
@@ -635,6 +661,10 @@
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
   backdrop-filter: blur(16px);
   z-index: 5;
+}
+
+.subtitle-popover--floating {
+  top: calc(100% + 12px);
 }
 
 .subtitle-popover__header,
@@ -726,45 +756,33 @@
   color: rgba(255, 255, 255, 0.72);
 }
 
-.player-frame--fullscreen {
+.player-frame:fullscreen,
+.player-frame:-webkit-full-screen {
   width: 100%;
   height: 100%;
   border: none;
   border-radius: 0;
   box-shadow: none;
   background: #000;
-  outline: none;
 }
 
-.player-frame--fullscreen .player-stage {
-  height: 100%;
-  min-height: 100%;
+.player-frame:fullscreen .player-stage,
+.player-frame:-webkit-full-screen .player-stage {
+  min-height: 100vh;
+  height: 100vh;
   aspect-ratio: auto;
 }
 
-.player-frame--fullscreen .player-controls {
-  position: absolute;
-  left: 20px;
-  right: 20px;
-  bottom: 20px;
-  z-index: 4;
-  padding: 16px 18px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 24px;
-  background:
-    radial-gradient(circle at top, rgba(74, 136, 255, 0.16), transparent 34%),
-    linear-gradient(180deg, rgba(8, 15, 28, 0.78), rgba(6, 10, 18, 0.9));
-  backdrop-filter: blur(20px);
+.player-frame:fullscreen .plyr,
+.player-frame:-webkit-full-screen .plyr,
+.player-frame .plyr--fullscreen-fallback {
+  border-radius: 0;
 }
 
-.player-frame--fullscreen.player-frame--controls-hidden {
-  cursor: none;
-}
-
-.player-frame--fullscreen.player-frame--controls-hidden .player-controls {
-  opacity: 0;
-  transform: translateY(18px);
-  pointer-events: none;
+.player-frame:fullscreen .plyr__video-wrapper,
+.player-frame:-webkit-full-screen .plyr__video-wrapper,
+.player-frame .plyr--fullscreen-fallback .plyr__video-wrapper {
+  height: 100vh;
 }
 
 .meta-grid {
@@ -878,20 +896,6 @@
   .meta-grid {
     grid-template-columns: 1fr;
   }
-
-  .player-controls {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .player-controls__time {
-    grid-column: 1 / -1;
-    min-width: 0;
-  }
-
-  .player-controls__actions {
-    grid-column: 1 / -1;
-  }
-
 }
 
 @media (max-width: 720px) {
@@ -942,6 +946,21 @@
   .subtitle-popover {
     width: 100%;
     right: 0;
+  }
+
+  .player-floating-actions {
+    top: 14px;
+    right: 14px;
+  }
+
+  .player-subtitle-button {
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 0.88rem;
+  }
+
+  .player-frame .plyr--video .plyr__controls {
+    padding: 14px 14px 12px;
   }
 
   .player-stage {
