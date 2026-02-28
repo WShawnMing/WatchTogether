@@ -281,9 +281,39 @@ export async function startLocalRelay(
     return `WEBVTT\n\n${withCueTimes}`
   }
 
+  function normalizeSubtitleText(buffer: Buffer) {
+    return buffer.toString('utf8').replace(/^\uFEFF/, '').replace(/\r+/g, '')
+  }
+
+  function getSubtitleFormat(originalName: string) {
+    const extension = path.extname(originalName).toLowerCase()
+
+    if (['.ass', '.ssa'].includes(extension)) {
+      return 'ass' as const
+    }
+
+    return 'vtt' as const
+  }
+
+  function getSubtitleFileExtension(originalName: string) {
+    return getSubtitleFormat(originalName) === 'ass'
+      ? path.extname(originalName).toLowerCase() || '.ass'
+      : '.vtt'
+  }
+
+  function getSubtitleContentType(originalName: string) {
+    return getSubtitleFormat(originalName) === 'ass'
+      ? 'text/x-ssa; charset=utf-8'
+      : 'text/vtt; charset=utf-8'
+  }
+
   function getSubtitleText(buffer: Buffer, originalName: string) {
     const extension = path.extname(originalName).toLowerCase()
-    const decodedText = buffer.toString('utf8')
+    const decodedText = normalizeSubtitleText(buffer)
+
+    if (['.ass', '.ssa'].includes(extension)) {
+      return decodedText
+    }
 
     if (extension === '.srt') {
       return convertSrtToVtt(decodedText)
@@ -549,9 +579,10 @@ export async function startLocalRelay(
       const { room } = context
       const originalName = decodeMultipartName(request.file.originalname)
       const extension = path.extname(originalName).toLowerCase()
+      const subtitleFormat = getSubtitleFormat(originalName)
 
-      if (!['.srt', '.vtt'].includes(extension)) {
-        response.status(400).json({ error: '目前只支持 .srt 和 .vtt 字幕' })
+      if (!['.srt', '.vtt', '.ass', '.ssa'].includes(extension)) {
+        response.status(400).json({ error: '目前只支持 .srt、.vtt、.ass 和 .ssa 字幕' })
         return
       }
 
@@ -560,7 +591,9 @@ export async function startLocalRelay(
 
       const subtitlePath = path.join(
         roomDir,
-        `${Date.now()}-${normalizeStoredBaseName(originalName) || 'subtitle'}.vtt`,
+        `${Date.now()}-${normalizeStoredBaseName(originalName) || 'subtitle'}${getSubtitleFileExtension(
+          originalName,
+        )}`,
       )
 
       deleteSubtitle(room)
@@ -573,7 +606,7 @@ export async function startLocalRelay(
       room.subtitle = {
         id: randomUUID(),
         name: originalName,
-        format: 'vtt',
+        format: subtitleFormat,
         language: detectSubtitleLanguage(originalName),
         uploadedAt: Date.now(),
         filePath: subtitlePath,
@@ -662,7 +695,7 @@ export async function startLocalRelay(
     }
 
     response.setHeader('Cache-Control', 'no-store')
-    response.setHeader('Content-Type', 'text/vtt; charset=utf-8')
+    response.setHeader('Content-Type', getSubtitleContentType(room.subtitle.name))
     createReadStream(room.subtitle.filePath).pipe(response)
   })
 

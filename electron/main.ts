@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { createSocket, type RemoteInfo, type Socket as DiscoverySocket } from 'node:dgram'
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeImage } from 'electron'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -15,9 +15,16 @@ const APP_INSTANCE_ID = randomUUID()
 const DISCOVERY_PORT = Number(process.env.WATCH_TOGETHER_DISCOVERY_PORT ?? 43153)
 const DISCOVERY_INTERVAL_MS = 1_500
 const DISCOVERY_TTL_MS = 4_500
+const APP_DISPLAY_NAME = 'WatchTogether'
 
 process.env.WS_NO_BUFFER_UTIL = '1'
 process.env.WS_NO_UTF_8_VALIDATE = '1'
+
+app.setName(APP_DISPLAY_NAME)
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.watchtogether.desktop')
+}
 
 let relayHandle: LocalRelayHandle | null = null
 let relayStartPromise: Promise<LocalRelayHandle> | null = null
@@ -34,6 +41,16 @@ const discoveredSessions = new Map<string, DiscoverySession>()
 type LocalRelayHandle = {
   close: () => Promise<void>
   port: number
+}
+
+function getRuntimeIconPath() {
+  const root = app.getAppPath()
+
+  if (app.isPackaged) {
+    return path.join(root, 'dist', 'app-icon.png')
+  }
+
+  return path.join(root, 'public', 'app-icon.png')
 }
 
 async function loadLocalRelay() {
@@ -320,19 +337,26 @@ async function shutdownDiscovery() {
 }
 
 function createMainWindow() {
+  const iconPath = getRuntimeIconPath()
   const window = new BrowserWindow({
     width: 1360,
     height: 900,
     minWidth: 1060,
     minHeight: 760,
-    title: 'WatchTogether',
+    title: APP_DISPLAY_NAME,
     backgroundColor: '#f4f5f7',
     autoHideMenuBar: true,
+    icon: iconPath,
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
     },
+  })
+
+  window.on('page-title-updated', (event) => {
+    event.preventDefault()
+    window.setTitle(APP_DISPLAY_NAME)
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -414,6 +438,14 @@ ipcMain.handle('discovery:list', async () => {
 })
 
 app.whenReady().then(() => {
+  if (process.platform === 'darwin') {
+    const icon = nativeImage.createFromPath(getRuntimeIconPath())
+
+    if (!icon.isEmpty()) {
+      app.dock?.setIcon(icon)
+    }
+  }
+
   void ensureDiscoverySocket()
   createMainWindow()
 

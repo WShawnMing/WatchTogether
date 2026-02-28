@@ -11,12 +11,14 @@
     "build:desktop": "vite build",
     "build:server": "tsup server/src/index.ts --format esm --out-dir server/dist --clean",
     "package:mac": "npm run build:desktop && electron-builder --mac",
-    "package:win": "npm run build:desktop && electron-builder --win",
+    "package:win": "npm run build:desktop && electron-builder --win --x64",
+    "package:win:arm64": "npm run build:desktop && electron-builder --win --arm64",
     "lint": "eslint .",
     "preview": "vite preview",
     "start:server": "tsx server/src/index.ts"
   },
   "dependencies": {
+    "assjs": "^0.1.5",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "mime-types": "^3.0.2",
@@ -59,18 +61,23 @@
       "dist-electron/**/*",
       "package.json"
     ],
+    "directories": {
+      "buildResources": "build"
+    },
     "mac": {
       "target": [
         "dmg",
         "zip"
       ],
-      "category": "public.app-category.entertainment"
+      "category": "public.app-category.entertainment",
+      "icon": "build/icon.icns"
     },
     "win": {
       "target": [
         "nsis",
         "zip"
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,

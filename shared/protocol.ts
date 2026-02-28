@@ -24,7 +24,7 @@ export interface MediaDescriptor {
 export interface SubtitleDescriptor {
   id: string
   name: string
-  format: 'vtt'
+  format: 'vtt' | 'ass'
   language: string | null
 }
 

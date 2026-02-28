@@ -1,10 +1,12 @@
 import {
   startTransition,
+  type CSSProperties,
   useCallback,
   useEffect,
   useRef,
   useState,
 } from 'react'
+import ASSRenderer from 'assjs'
 import { io, type Socket } from 'socket.io-client'
 import './App.css'
 import {
@@ -41,6 +43,12 @@ interface ConnectRoomOptions {
   roomName?: string
 }
 
+interface PresenceToast {
+  id: string
+  title: string
+  detail: string
+}
+
 const EMPTY_RELAY_STATUS: RelayStatus = {
   running: false,
   port: null,
@@ -51,7 +59,7 @@ const EMPTY_RELAY_STATUS: RelayStatus = {
 
 const VIDEO_ACCEPT =
   '.mp4,.m4v,.mov,.webm,.mkv,.avi,.ts,.mpeg,.mpg,.ogv,.wmv'
-const SUBTITLE_ACCEPT = '.srt,.vtt'
+const SUBTITLE_ACCEPT = '.srt,.vtt,.ass,.ssa'
 
 function normalizeServerUrl(input: string) {
   const trimmed = input.trim()
@@ -95,6 +103,22 @@ function formatBytes(value: number) {
   const amount = value / 1024 ** level
 
   return `${amount.toFixed(level === 0 ? 0 : 1)} ${units[level]}`
+}
+
+function formatPresenceSummary(names: string[], verb: '加入' | '离开') {
+  if (names.length === 0) {
+    return ''
+  }
+
+  if (names.length === 1) {
+    return `${names[0]} ${verb}了房间`
+  }
+
+  if (names.length === 2) {
+    return `${names[0]} 和 ${names[1]} ${verb}了房间`
+  }
+
+  return `${names[0]}、${names[1]} 等 ${names.length} 人${verb}了房间`
 }
 
 function buildMediaUrl(serverUrl: string, roomId: string, mediaId: string) {
@@ -231,16 +255,32 @@ function App() {
   const [selectedSubtitleName, setSelectedSubtitleName] = useState('')
   const [relayBusy, setRelayBusy] = useState(false)
   const [joiningRoomId, setJoiningRoomId] = useState<string | null>(null)
+  const [subtitleScale, setSubtitleScale] = useState(1)
+  const [subtitleOffsetY, setSubtitleOffsetY] = useState(0)
+  const [subtitlePanelOpen, setSubtitlePanelOpen] = useState(false)
+  const [videoDurationValue, setVideoDurationValue] = useState(0)
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0)
+  const [videoPaused, setVideoPaused] = useState(true)
+  const [isScrubbing, setIsScrubbing] = useState(false)
+  const [scrubValue, setScrubValue] = useState(0)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
+  const [presenceToasts, setPresenceToasts] = useState<PresenceToast[]>([])
 
   const socketRef = useRef<Socket | null>(null)
   const roomRef = useRef<RoomSnapshot | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const playerFrameRef = useRef<HTMLDivElement | null>(null)
+  const subtitleLayerRef = useRef<HTMLDivElement | null>(null)
+  const assRendererRef = useRef<ASSRenderer | null>(null)
   const joinPayloadRef = useRef<JoinRoomPayload | null>(null)
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
   const suppressEventsRef = useRef(false)
   const suppressTimeoutRef = useRef<number | null>(null)
   const localBufferingRef = useRef(false)
   const manualDisconnectRef = useRef(false)
+  const toastTimersRef = useRef<Map<string, number>>(new Map())
+  const memberPresencePrimedRef = useRef(false)
 
   const currentMember =
     room?.members.find((member) => member.socketId === socketId) ?? null
@@ -254,17 +294,39 @@ function App() {
     room?.subtitle && room.roomId && serverUrl
       ? buildSubtitleUrl(serverUrl, room.roomId, room.subtitle.id)
       : null
+  const subtitleFormat = room?.subtitle?.format ?? null
   const audienceCount = room?.members.length ?? 0
   const syncMode = room?.syncMode ?? 'soft'
   const syncModeLabel = syncMode === 'strict' ? '严格同步' : '柔性同步'
   const playbackPosition = playback
     ? deriveCurrentPosition(playback.playbackState, playback.serverTime)
     : 0
+  const effectiveDuration = Math.max(videoDurationValue || room?.media?.duration || 0, 0)
+  const displayedCurrentTime = Math.min(isScrubbing ? scrubValue : videoCurrentTime, effectiveDuration || Number.MAX_SAFE_INTEGER)
   const connectionLabel = getConnectionLabel(
     connectionState,
     relayStatus.running,
   )
   const videoKey = `${room?.media?.id ?? 'empty'}:${room?.subtitle?.id ?? 'nosub'}`
+  const isMediaUploading = uploadStatus === 'reading' || uploadStatus === 'uploading'
+  const isSubtitleUploading = subtitleStatus === 'uploading'
+  const mediaButtonLabel = isMediaUploading
+    ? '上传影片中...'
+    : uploadStatus === 'done'
+      ? '影片已更新'
+      : uploadStatus === 'error'
+        ? '重试影片上传'
+        : '选择影片'
+  const subtitleButtonLabel = isSubtitleUploading
+    ? '上传字幕中...'
+    : subtitleStatus === 'done'
+      ? '字幕已更新'
+      : subtitleStatus === 'error'
+        ? '重试字幕上传'
+        : '上传字幕'
+  const mediaButtonMeta = selectedFileName || room?.media?.name || 'MP4 / MKV / MOV'
+  const subtitleButtonMeta =
+    selectedSubtitleName || room?.subtitle?.name || '.srt / .vtt / .ass'
 
   useEffect(() => {
     roomRef.current = room
@@ -272,9 +334,23 @@ function App() {
 
   useEffect(() => {
     const savedNickname = window.localStorage.getItem('watchtogether:nickname')
+    const savedSubtitleScale = Number(
+      window.localStorage.getItem('watchtogether:subtitle-scale') ?? '1',
+    )
+    const savedSubtitleOffset = Number(
+      window.localStorage.getItem('watchtogether:subtitle-offset-y') ?? '0',
+    )
 
     if (savedNickname) {
       setNickname(savedNickname)
+    }
+
+    if (Number.isFinite(savedSubtitleScale) && savedSubtitleScale >= 0.7 && savedSubtitleScale <= 1.6) {
+      setSubtitleScale(savedSubtitleScale)
+    }
+
+    if (Number.isFinite(savedSubtitleOffset) && savedSubtitleOffset >= -120 && savedSubtitleOffset <= 120) {
+      setSubtitleOffsetY(savedSubtitleOffset)
     }
   }, [])
 
@@ -283,6 +359,20 @@ function App() {
       window.localStorage.setItem('watchtogether:nickname', nickname.trim())
     }
   }, [nickname])
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      'watchtogether:subtitle-scale',
+      subtitleScale.toFixed(2),
+    )
+  }, [subtitleScale])
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      'watchtogether:subtitle-offset-y',
+      String(Math.round(subtitleOffsetY)),
+    )
+  }, [subtitleOffsetY])
 
   useEffect(() => {
     if (!window.desktopApp?.relay) {
@@ -460,17 +550,106 @@ function App() {
   }, [applyRemotePlayback, playback, room?.media])
 
   useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement))
+    }
+
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!room?.subtitle) {
+      setSubtitlePanelOpen(false)
+    }
+  }, [room?.subtitle])
+
+  useEffect(() => {
+    assRendererRef.current?.destroy()
+    assRendererRef.current = null
+
+    const subtitleLayer = subtitleLayerRef.current
+
+    if (subtitleLayer) {
+      subtitleLayer.replaceChildren()
+    }
+
+    if (
+      !subtitleUrl ||
+      subtitleFormat !== 'ass' ||
+      !videoRef.current ||
+      !subtitleLayer
+    ) {
+      return
+    }
+
+    let cancelled = false
+
+    const attachAssSubtitle = async () => {
+      try {
+        const response = await fetch(subtitleUrl)
+
+        if (!response.ok) {
+          throw new Error('字幕文件加载失败')
+        }
+
+        const content = await response.text()
+
+        if (cancelled || !videoRef.current || !subtitleLayerRef.current) {
+          return
+        }
+
+        const renderer = new ASSRenderer(content, videoRef.current, {
+          container: subtitleLayerRef.current,
+          resampling: 'video_height',
+        })
+
+        assRendererRef.current = renderer
+      } catch (error) {
+        if (!cancelled) {
+          setErrorMessage(
+            error instanceof Error ? error.message : 'ASS 字幕渲染失败',
+          )
+        }
+      }
+    }
+
+    void attachAssSubtitle()
+
+    return () => {
+      cancelled = true
+      assRendererRef.current?.destroy()
+      assRendererRef.current = null
+
+      subtitleLayer.replaceChildren()
+    }
+  }, [subtitleFormat, subtitleUrl, videoKey])
+
+  useEffect(() => {
+    const toastTimers = toastTimersRef.current
+
     return () => {
       if (suppressTimeoutRef.current !== null) {
         window.clearTimeout(suppressTimeoutRef.current)
       }
 
+      for (const timer of toastTimers.values()) {
+        window.clearTimeout(timer)
+      }
+
+      toastTimers.clear()
+
+      assRendererRef.current?.destroy()
       void window.desktopApp?.discovery?.advertise(null)
       socketRef.current?.disconnect()
     }
   }, [])
 
   const handleSnapshot = (snapshot: RoomSnapshot) => {
+    const previousRoom = roomRef.current
     const previousMediaId = roomRef.current?.media?.id ?? null
     const nextMediaId = snapshot.media?.id ?? null
 
@@ -479,9 +658,75 @@ function App() {
       setLocalBuffering(false)
       localBufferingRef.current = false
       pendingPlaybackRef.current = null
+      setVideoCurrentTime(0)
+      setVideoDurationValue(0)
+      setVideoPaused(true)
+      setScrubValue(0)
+      setIsScrubbing(false)
+    }
+
+    if (
+      memberPresencePrimedRef.current &&
+      previousRoom?.roomId === snapshot.roomId
+    ) {
+      const previousMembers = new Map(
+        previousRoom.members.map((member) => [member.socketId, member]),
+      )
+      const currentMembers = new Map(
+        snapshot.members.map((member) => [member.socketId, member]),
+      )
+      const joinedMembers = snapshot.members
+        .filter((member) => !previousMembers.has(member.socketId))
+        .filter((member) => member.socketId !== socketId)
+      const leftMembers = previousRoom.members
+        .filter((member) => !currentMembers.has(member.socketId))
+        .filter((member) => member.socketId !== socketId)
+
+      if (joinedMembers.length > 0) {
+        const toastId = `${Date.now()}-join-${joinedMembers.map((member) => member.socketId).join('-')}`
+        const timer = window.setTimeout(() => {
+          setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
+          toastTimersRef.current.delete(toastId)
+        }, 2600)
+
+        toastTimersRef.current.set(toastId, timer)
+        setPresenceToasts((current) => [
+          ...current.slice(-2),
+          {
+            id: toastId,
+            title: formatPresenceSummary(
+              joinedMembers.map((member) => member.nickname),
+              '加入',
+            ),
+            detail: '已加入当前放映室',
+          },
+        ])
+      }
+
+      if (leftMembers.length > 0) {
+        const toastId = `${Date.now()}-leave-${leftMembers.map((member) => member.socketId).join('-')}`
+        const timer = window.setTimeout(() => {
+          setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
+          toastTimersRef.current.delete(toastId)
+        }, 2600)
+
+        toastTimersRef.current.set(toastId, timer)
+        setPresenceToasts((current) => [
+          ...current.slice(-2),
+          {
+            id: toastId,
+            title: formatPresenceSummary(
+              leftMembers.map((member) => member.nickname),
+              '离开',
+            ),
+            detail: '已离开当前放映室',
+          },
+        ])
+      }
     }
 
     roomRef.current = snapshot
+    memberPresencePrimedRef.current = true
 
     startTransition(() => {
       setRoom(snapshot)
@@ -680,6 +925,7 @@ function App() {
 
       nextSocket.on('disconnect', () => {
         setSocketId('')
+        memberPresencePrimedRef.current = false
 
         if (manualDisconnectRef.current) {
           setConnectionState('idle')
@@ -710,6 +956,7 @@ function App() {
     joinPayloadRef.current = null
     pendingPlaybackRef.current = null
     localBufferingRef.current = false
+    memberPresencePrimedRef.current = false
     roomRef.current = null
     setSocketId('')
     setConnectionState('idle')
@@ -726,6 +973,11 @@ function App() {
     setSubtitleLabel('还没有字幕')
     setSelectedSubtitleName('')
     setJoiningRoomId(null)
+    setPresenceToasts([])
+    for (const timer of toastTimersRef.current.values()) {
+      window.clearTimeout(timer)
+    }
+    toastTimersRef.current.clear()
     socketRef.current?.removeAllListeners()
     socketRef.current?.disconnect()
     socketRef.current = null
@@ -920,10 +1172,85 @@ function App() {
     }
   }
 
+  const togglePlayback = async () => {
+    const video = videoRef.current
+
+    if (!video) {
+      return
+    }
+
+    if (video.paused) {
+      try {
+        await video.play()
+        setAutoplayBlocked(false)
+      } catch {
+        setAutoplayBlocked(true)
+      }
+
+      return
+    }
+
+    video.pause()
+  }
+
+  const toggleMute = () => {
+    const video = videoRef.current
+
+    if (!video) {
+      return
+    }
+
+    video.muted = !video.muted
+    setIsMuted(video.muted)
+  }
+
+  const toggleFullscreen = async () => {
+    const playerFrame = playerFrameRef.current
+
+    if (!playerFrame) {
+      return
+    }
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+      } else {
+        await playerFrame.requestFullscreen()
+      }
+    } catch {
+      setErrorMessage('切换全屏失败')
+    }
+  }
+
+  const handleSeekChange = (nextValue: number) => {
+    const video = videoRef.current
+
+    setIsScrubbing(true)
+    setScrubValue(nextValue)
+    setVideoCurrentTime(nextValue)
+
+    if (!video) {
+      return
+    }
+
+    video.currentTime = nextValue
+  }
+
   return (
     <div className="app-shell">
+      {presenceToasts.length ? (
+        <div className="toast-stack" aria-live="polite" aria-atomic="true">
+          {presenceToasts.map((toast) => (
+            <article className="toast" key={toast.id}>
+              <strong>{toast.title}</strong>
+              <p>{toast.detail}</p>
+            </article>
+          ))}
+        </div>
+      ) : null}
+
       <header className="topbar">
-        <div>
+        <div className="topbar__copy">
           <p className="topbar__eyebrow">WatchTogether</p>
           <h1>同一局域网，直接一起看。</h1>
           <p className="topbar__lead">
@@ -953,7 +1280,7 @@ function App() {
 
       <main className="workspace">
         <aside className="sidebar">
-          <section className="panel">
+          <section className="panel panel--profile">
             <div className="panel__header">
               <div>
                 <p className="panel__eyebrow">Profile</p>
@@ -1008,7 +1335,7 @@ function App() {
             </p>
           </section>
 
-          <section className="panel">
+          <section className="panel panel--nearby">
             <div className="panel__header">
               <div>
                 <p className="panel__eyebrow">Nearby</p>
@@ -1091,7 +1418,7 @@ function App() {
           </section>
 
           {room ? (
-            <section className="panel">
+            <section className="panel panel--room">
               <div className="panel__header">
                 <div>
                   <p className="panel__eyebrow">Room</p>
@@ -1193,41 +1520,67 @@ function App() {
 
             {isHost ? (
               <div className="upload-toolbar">
-                <label className="button button--primary button--file">
-                  选择影片
-                  <input
-                    type="file"
-                    accept={VIDEO_ACCEPT}
-                    onChange={(event) => {
-                      const nextFile = event.target.files?.[0]
+                <div className="segment upload-segment">
+                  <label
+                    className={`segment__button segment__button--file ${
+                      uploadStatus === 'done'
+                        ? 'segment__button--success'
+                        : uploadStatus === 'error'
+                          ? 'segment__button--warning'
+                          : isMediaUploading
+                            ? 'segment__button--active'
+                            : ''
+                    }`}
+                  >
+                    <span className="segment__title">{mediaButtonLabel}</span>
+                    <span className="segment__meta">{mediaButtonMeta}</span>
+                    <input
+                      type="file"
+                      accept={VIDEO_ACCEPT}
+                      disabled={isMediaUploading || isSubtitleUploading}
+                      onChange={(event) => {
+                        const nextFile = event.target.files?.[0]
 
-                      if (!nextFile) {
-                        return
-                      }
+                        if (!nextFile) {
+                          return
+                        }
 
-                      void uploadMedia(nextFile)
-                      event.target.value = ''
-                    }}
-                  />
-                </label>
+                        void uploadMedia(nextFile)
+                        event.target.value = ''
+                      }}
+                    />
+                  </label>
 
-                <label className="button button--secondary button--file">
-                  上传字幕
-                  <input
-                    type="file"
-                    accept={SUBTITLE_ACCEPT}
-                    onChange={(event) => {
-                      const nextFile = event.target.files?.[0]
+                  <label
+                    className={`segment__button segment__button--file ${
+                      subtitleStatus === 'done'
+                        ? 'segment__button--success'
+                        : subtitleStatus === 'error'
+                          ? 'segment__button--warning'
+                          : isSubtitleUploading
+                            ? 'segment__button--active'
+                            : ''
+                    }`}
+                  >
+                    <span className="segment__title">{subtitleButtonLabel}</span>
+                    <span className="segment__meta">{subtitleButtonMeta}</span>
+                    <input
+                      type="file"
+                      accept={SUBTITLE_ACCEPT}
+                      disabled={isMediaUploading || isSubtitleUploading}
+                      onChange={(event) => {
+                        const nextFile = event.target.files?.[0]
 
-                      if (!nextFile) {
-                        return
-                      }
+                        if (!nextFile) {
+                          return
+                        }
 
-                      void uploadSubtitle(nextFile)
-                      event.target.value = ''
-                    }}
-                  />
-                </label>
+                        void uploadSubtitle(nextFile)
+                        event.target.value = ''
+                      }}
+                    />
+                  </label>
+                </div>
 
                 <p className="support-note">{formatSupportHint(selectedFileName || room?.media?.name)}</p>
               </div>
@@ -1235,75 +1588,296 @@ function App() {
               <p className="support-note">{formatSupportHint(room?.media?.name)}</p>
             )}
 
-            <div className="player-frame">
-              {mediaUrl ? (
-                <video
-                  key={videoKey}
-                  ref={videoRef}
-                  className="video"
-                  src={mediaUrl}
-                  controls
-                  playsInline
-                  preload="auto"
-                  onPlay={() => {
-                    setAutoplayBlocked(false)
-                    publishPlaybackIntent('user')
-                  }}
-                  onPause={() => publishPlaybackIntent('user')}
-                  onSeeked={() => publishPlaybackIntent('user')}
-                  onRateChange={() => publishPlaybackIntent('user')}
-                  onLoadedMetadata={() => {
-                    const pending = pendingPlaybackRef.current ?? playback
+            <div className="player-frame" ref={playerFrameRef}>
+              <div className="player-stage">
+                {mediaUrl ? (
+                  <video
+                    key={videoKey}
+                    ref={videoRef}
+                    className="video"
+                    src={mediaUrl}
+                    disablePictureInPicture
+                    disableRemotePlayback
+                    playsInline
+                    preload="auto"
+                    onContextMenu={(event) => {
+                      event.preventDefault()
+                    }}
+                    onPlay={() => {
+                      setAutoplayBlocked(false)
+                      setVideoPaused(false)
+                      publishPlaybackIntent('user')
+                    }}
+                    onPause={() => {
+                      setVideoPaused(true)
+                      publishPlaybackIntent('user')
+                    }}
+                    onSeeked={() => publishPlaybackIntent('user')}
+                    onRateChange={() => publishPlaybackIntent('user')}
+                    onLoadedMetadata={() => {
+                      const video = videoRef.current
+                      const pending = pendingPlaybackRef.current ?? playback
 
-                    if (pending) {
-                      applyRemotePlayback(pending)
-                    }
-                  }}
-                  onWaiting={() => publishBufferState(true)}
-                  onStalled={() => publishBufferState(true)}
-                  onCanPlay={() => {
-                    if (localBufferingRef.current) {
-                      publishBufferState(false)
-                    }
-                  }}
-                  onPlaying={() => {
-                    setAutoplayBlocked(false)
+                      if (video) {
+                        setVideoDurationValue(
+                          Number.isFinite(video.duration) ? video.duration : 0,
+                        )
+                        setVideoCurrentTime(video.currentTime)
+                        setIsMuted(video.muted)
+                        setVideoPaused(video.paused)
+                      }
 
-                    if (localBufferingRef.current) {
-                      publishBufferState(false)
-                      requestFreshPlaybackState()
-                    }
-                  }}
-                  onEnded={() => publishPlaybackIntent('user')}
-                  onError={() => {
-                    setErrorMessage(
-                      '当前片源的编码可能不被内置播放器支持。建议优先使用 H.264/AAC 的 MP4，或确认 MKV 内部编码可播放。',
-                    )
-                  }}
-                >
-                  {subtitleUrl ? (
-                    <track
-                      default
-                      kind="subtitles"
-                      label={room?.subtitle?.name ?? '字幕'}
-                      src={subtitleUrl}
-                      srcLang={room?.subtitle?.language ?? 'zh'}
-                    />
-                  ) : null}
-                </video>
-              ) : (
-                <div className="video video--placeholder">
-                  <div>
-                    <p>还没有共享视频</p>
-                    <strong>房主选片后，大家会直接拉取同一份片源并保持时间轴一致。</strong>
+                      if (pending) {
+                        applyRemotePlayback(pending)
+                      }
+                    }}
+                    onLoadedData={() => {
+                      const video = videoRef.current
+
+                      if (!video) {
+                        return
+                      }
+
+                      if (video.currentTime === 0) {
+                        video.currentTime = 0.001
+                      }
+
+                      setVideoCurrentTime(video.currentTime)
+                    }}
+                    onDurationChange={() => {
+                      const video = videoRef.current
+
+                      if (video) {
+                        setVideoDurationValue(
+                          Number.isFinite(video.duration) ? video.duration : 0,
+                        )
+                      }
+                    }}
+                    onTimeUpdate={() => {
+                      const video = videoRef.current
+
+                      if (!video || isScrubbing) {
+                        return
+                      }
+
+                      setVideoCurrentTime(video.currentTime)
+                    }}
+                    onVolumeChange={() => {
+                      const video = videoRef.current
+
+                      if (video) {
+                        setIsMuted(video.muted || video.volume === 0)
+                      }
+                    }}
+                    onWaiting={() => publishBufferState(true)}
+                    onStalled={() => publishBufferState(true)}
+                    onCanPlay={() => {
+                      if (localBufferingRef.current) {
+                        publishBufferState(false)
+                      }
+                    }}
+                    onPlaying={() => {
+                      setAutoplayBlocked(false)
+
+                      if (localBufferingRef.current) {
+                        publishBufferState(false)
+                        requestFreshPlaybackState()
+                      }
+                    }}
+                    onEnded={() => publishPlaybackIntent('user')}
+                    onError={() => {
+                      setErrorMessage(
+                        '当前片源的编码可能不被内置播放器支持。建议优先使用 H.264/AAC 的 MP4，或确认 MKV 内部编码可播放。',
+                      )
+                    }}
+                  >
+                    {subtitleUrl && subtitleFormat === 'vtt' ? (
+                      <track
+                        default
+                        kind="subtitles"
+                        label={room?.subtitle?.name ?? '字幕'}
+                        src={subtitleUrl}
+                        srcLang={room?.subtitle?.language ?? 'zh'}
+                      />
+                    ) : null}
+                  </video>
+                ) : (
+                  <div className="video video--placeholder">
+                    <div>
+                      <p>还没有共享视频</p>
+                      <strong>房主选片后，大家会直接拉取同一份片源并保持时间轴一致。</strong>
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
 
-              {autoplayBlocked ? (
-                <div className="player-overlay">
-                  <strong>系统拦截了自动播放</strong>
-                  <p>手动点一次播放键，后续同步控制会继续生效。</p>
+                <div
+                  ref={subtitleLayerRef}
+                  className={`subtitle-layer ${
+                    subtitleFormat === 'ass' ? 'subtitle-layer--active' : ''
+                  }`}
+                  style={
+                    {
+                      '--subtitle-scale': subtitleScale,
+                      '--subtitle-offset-y': `${subtitleOffsetY}px`,
+                    } as CSSProperties
+                  }
+                />
+
+                {autoplayBlocked ? (
+                  <div className="player-overlay">
+                    <strong>系统拦截了自动播放</strong>
+                    <p>手动点一次播放键，后续同步控制会继续生效。</p>
+                  </div>
+                ) : null}
+              </div>
+
+              {mediaUrl ? (
+                <div className="player-controls">
+                  <button
+                    className="player-controls__button"
+                    onClick={() => {
+                      void togglePlayback()
+                    }}
+                    type="button"
+                  >
+                    {videoPaused ? '播放' : '暂停'}
+                  </button>
+
+                  <div className="player-controls__time">
+                    {formatDuration(displayedCurrentTime)} /{' '}
+                    {formatDuration(effectiveDuration)}
+                  </div>
+
+                  <input
+                    className="player-controls__seek"
+                    type="range"
+                    min="0"
+                    max={Math.max(effectiveDuration, 0.1)}
+                    step="0.1"
+                    value={displayedCurrentTime}
+                    onMouseDown={() => {
+                      setIsScrubbing(true)
+                    }}
+                    onMouseUp={() => {
+                      setIsScrubbing(false)
+                    }}
+                    onTouchStart={() => {
+                      setIsScrubbing(true)
+                    }}
+                    onTouchEnd={() => {
+                      setIsScrubbing(false)
+                    }}
+                    onChange={(event) => {
+                      handleSeekChange(Number(event.target.value))
+                    }}
+                  />
+
+                  <div className="player-controls__actions">
+                    <button
+                      className="player-controls__icon"
+                      onClick={toggleMute}
+                      type="button"
+                    >
+                      {isMuted ? '取消静音' : '静音'}
+                    </button>
+
+                    {room?.subtitle ? (
+                      <div className="player-controls__menu">
+                        <button
+                          className={`player-controls__icon ${
+                            subtitlePanelOpen
+                              ? 'player-controls__icon--active'
+                              : ''
+                          }`}
+                          onClick={() => {
+                            setSubtitlePanelOpen((current) => !current)
+                          }}
+                          type="button"
+                        >
+                          选项
+                        </button>
+
+                        {subtitlePanelOpen ? (
+                          <div className="subtitle-popover">
+                            <div className="subtitle-popover__header">
+                              <strong>字幕</strong>
+                              <span>
+                                {subtitleFormat === 'ass'
+                                  ? 'ASS 渲染'
+                                  : '原生字幕'}
+                              </span>
+                            </div>
+
+                            <label className="subtitle-control">
+                              <span>字号</span>
+                              <input
+                                type="range"
+                                min="0.7"
+                                max="1.6"
+                                step="0.05"
+                                value={subtitleScale}
+                                onChange={(event) => {
+                                  setSubtitleScale(Number(event.target.value))
+                                }}
+                                disabled={subtitleFormat !== 'ass'}
+                              />
+                              <strong>{Math.round(subtitleScale * 100)}%</strong>
+                            </label>
+
+                            <label className="subtitle-control">
+                              <span>位置</span>
+                              <input
+                                type="range"
+                                min="-120"
+                                max="120"
+                                step="4"
+                                value={subtitleOffsetY}
+                                onChange={(event) => {
+                                  setSubtitleOffsetY(Number(event.target.value))
+                                }}
+                                disabled={subtitleFormat !== 'ass'}
+                              />
+                              <strong>
+                                {subtitleOffsetY > 0
+                                  ? `+${subtitleOffsetY}`
+                                  : subtitleOffsetY}
+                                px
+                              </strong>
+                            </label>
+
+                            <div className="subtitle-popover__footer">
+                              <p>
+                                {subtitleFormat === 'ass'
+                                  ? '可直接调节字号和上下位置。'
+                                  : '原生字幕目前不开放细粒度样式调节。'}
+                              </p>
+                              <button
+                                className="button button--secondary"
+                                onClick={() => {
+                                  setSubtitleScale(1)
+                                  setSubtitleOffsetY(0)
+                                }}
+                                disabled={subtitleFormat !== 'ass'}
+                                type="button"
+                              >
+                                重置
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    <button
+                      className="player-controls__icon"
+                      onClick={() => {
+                        void toggleFullscreen()
+                      }}
+                      type="button"
+                    >
+                      {isFullscreen ? '退出全屏' : '全屏'}
+                    </button>
+                  </div>
                 </div>
               ) : null}
             </div>
