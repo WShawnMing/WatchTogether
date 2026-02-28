@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
 import { createServer, type Server as HttpServer } from 'node:http'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import cors from 'cors'
 import express, { type Request } from 'express'
 import mime from 'mime-types'
@@ -50,12 +49,8 @@ export interface LocalRelayHandle {
 interface StartLocalRelayOptions {
   port?: number
   roomIdleTtlMinutes?: number
+  storageRoot?: string
 }
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const UPLOAD_ROOT = path.resolve(__dirname, '../uploads')
-
-mkdirSync(UPLOAD_ROOT, { recursive: true })
 
 export async function startLocalRelay(
   options: StartLocalRelayOptions = {},
@@ -63,6 +58,11 @@ export async function startLocalRelay(
   const rooms = new Map<string, RoomState>()
   const socketToRoom = new Map<string, string>()
   const roomIdleTtlMs = (options.roomIdleTtlMinutes ?? 120) * 60 * 1000
+  const uploadRoot = path.resolve(
+    options.storageRoot ?? process.env.WATCH_TOGETHER_STORAGE_DIR ?? '.watchtogether/uploads',
+  )
+
+  mkdirSync(uploadRoot, { recursive: true })
 
   function createRoom(roomId: string, hostSocketId: string) {
     const now = Date.now()
@@ -171,7 +171,7 @@ export async function startLocalRelay(
     deleteMedia(room)
 
     try {
-      rmSync(path.join(UPLOAD_ROOT, roomId), { recursive: true, force: true })
+      rmSync(path.join(uploadRoot, roomId), { recursive: true, force: true })
     } catch {
       // noop
     }
@@ -281,7 +281,7 @@ export async function startLocalRelay(
         ? request.params.roomId[0]
         : request.params.roomId ?? ''
       const roomId = normalizeRoomId(rawRoomId) || createRoomCode()
-      const roomDir = path.join(UPLOAD_ROOT, roomId)
+      const roomDir = path.join(uploadRoot, roomId)
       mkdirSync(roomDir, { recursive: true })
       callback(null, roomDir)
     },

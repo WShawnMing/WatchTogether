@@ -2,10 +2,20 @@ import { app, BrowserWindow, ipcMain } from 'electron'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { startLocalRelay, type LocalRelayHandle } from '../server/src/localRelay'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+process.env.WS_NO_BUFFER_UTIL = '1'
+process.env.WS_NO_UTF_8_VALIDATE = '1'
 let relayHandle: LocalRelayHandle | null = null
+
+type LocalRelayHandle = {
+  close: () => Promise<void>
+  port: number
+}
+
+async function loadLocalRelay() {
+  return import('../server/src/localRelay')
+}
 
 function getReachableUrls(port: number) {
   const urls = new Set<string>([`http://127.0.0.1:${port}`])
@@ -47,9 +57,12 @@ function createMainWindow() {
 
 ipcMain.handle('relay:start', async (_event, preferredPort?: number) => {
   if (!relayHandle) {
+    const { startLocalRelay } = await loadLocalRelay()
+
     relayHandle = await startLocalRelay({
       port: preferredPort,
       roomIdleTtlMinutes: Number(process.env.ROOM_IDLE_TTL_MINUTES ?? 120),
+      storageRoot: path.join(app.getPath('userData'), 'uploads'),
     })
   }
 
