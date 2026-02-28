@@ -1,8 +1,26 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { startLocalRelay, type LocalRelayHandle } from '../server/src/localRelay'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+let relayHandle: LocalRelayHandle | null = null
+
+function getReachableUrls(port: number) {
+  const urls = new Set<string>([`http://127.0.0.1:${port}`])
+  const interfaces = os.networkInterfaces()
+
+  for (const network of Object.values(interfaces)) {
+    for (const address of network ?? []) {
+      if (address.family === 'IPv4' && !address.internal) {
+        urls.add(`http://${address.address}:${port}`)
+      }
+    }
+  }
+
+  return [...urls]
+}
 
 function createMainWindow() {
   const window = new BrowserWindow({
@@ -27,6 +45,57 @@ function createMainWindow() {
   }
 }
 
+ipcMain.handle('relay:start', async (_event, preferredPort?: number) => {
+  if (!relayHandle) {
+    relayHandle = await startLocalRelay({
+      port: preferredPort,
+      roomIdleTtlMinutes: Number(process.env.ROOM_IDLE_TTL_MINUTES ?? 120),
+    })
+  }
+
+  const urls = getReachableUrls(relayHandle.port)
+
+  return {
+    port: relayHandle.port,
+    localUrl: `http://127.0.0.1:${relayHandle.port}`,
+    shareUrls: urls.filter((url) => !url.includes('127.0.0.1')),
+    allUrls: urls,
+  }
+})
+
+ipcMain.handle('relay:stop', async () => {
+  if (!relayHandle) {
+    return { ok: true }
+  }
+
+  await relayHandle.close()
+  relayHandle = null
+
+  return { ok: true }
+})
+
+ipcMain.handle('relay:status', async () => {
+  if (!relayHandle) {
+    return {
+      running: false,
+      localUrl: null,
+      shareUrls: [],
+      allUrls: [],
+      port: null,
+    }
+  }
+
+  const urls = getReachableUrls(relayHandle.port)
+
+  return {
+    running: true,
+    port: relayHandle.port,
+    localUrl: `http://127.0.0.1:${relayHandle.port}`,
+    shareUrls: urls.filter((url) => !url.includes('127.0.0.1')),
+    allUrls: urls,
+  }
+})
+
 app.whenReady().then(() => {
   createMainWindow()
 
@@ -41,4 +110,9 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+app.on('before-quit', () => {
+  void relayHandle?.close()
+  relayHandle = null
 })

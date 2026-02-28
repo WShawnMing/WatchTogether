@@ -23,19 +23,67 @@ import {
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
 type UploadStatus = 'idle' | 'reading' | 'uploading' | 'done' | 'error'
 
-const DEFAULT_SERVER_URL =
-  import.meta.env.VITE_SERVER_URL?.trim() || 'http://localhost:4000'
+interface RelayStatus {
+  running: boolean
+  port: number | null
+  localUrl: string | null
+  shareUrls: string[]
+  allUrls: string[]
+}
+
+interface InvitePayload {
+  roomId: string
+  serverUrl: string
+}
+
+const EMPTY_RELAY_STATUS: RelayStatus = {
+  running: false,
+  port: null,
+  localUrl: null,
+  shareUrls: [],
+  allUrls: [],
+}
 
 function normalizeServerUrl(input: string) {
   const trimmed = input.trim()
 
   if (!trimmed) {
-    return DEFAULT_SERVER_URL
+    return ''
   }
 
   const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
 
   return withProtocol.replace(/\/+$/, '')
+}
+
+function encodeInvite(payload: InvitePayload) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
+}
+
+function decodeInvite(rawValue: string) {
+  const trimmed = rawValue.trim()
+
+  if (!trimmed) {
+    throw new Error('邀请内容为空')
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as InvitePayload
+    if (parsed.roomId && parsed.serverUrl) {
+      return parsed
+    }
+  } catch {
+    // fall through
+  }
+
+  const decoded = decodeURIComponent(escape(atob(trimmed)))
+  const payload = JSON.parse(decoded) as InvitePayload
+
+  if (!payload.roomId || !payload.serverUrl) {
+    throw new Error('邀请内容格式不正确')
+  }
+
+  return payload
 }
 
 function formatDuration(seconds: number) {
@@ -130,10 +178,13 @@ function StatusPill({
 }
 
 function App() {
-  const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL)
+  const [serverUrl, setServerUrl] = useState('')
   const [nickname, setNickname] = useState('')
   const [roomInput, setRoomInput] = useState(createRoomCode())
+  const [inviteInput, setInviteInput] = useState('')
   const [socketId, setSocketId] = useState('')
+  const [shareUrl, setShareUrl] = useState('')
+  const [relayStatus, setRelayStatus] = useState<RelayStatus>(EMPTY_RELAY_STATUS)
   const [connectionState, setConnectionState] =
     useState<ConnectionState>('idle')
   const [room, setRoom] = useState<RoomSnapshot | null>(null)
@@ -142,9 +193,10 @@ function App() {
   const [localBuffering, setLocalBuffering] = useState(false)
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
   const [roomCodeCopied, setRoomCodeCopied] = useState(false)
+  const [inviteCopied, setInviteCopied] = useState(false)
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>('idle')
   const [uploadProgress, setUploadProgress] = useState(0)
-  const [uploadLabel, setUploadLabel] = useState('等待上传')
+  const [uploadLabel, setUploadLabel] = useState('等待导入')
   const [selectedFileName, setSelectedFileName] = useState('')
 
   const socketRef = useRef<Socket | null>(null)
@@ -161,7 +213,7 @@ function App() {
     room?.members.find((member) => member.socketId === socketId) ?? null
   const isHost = Boolean(currentMember?.isHost)
   const mediaUrl =
-    room?.media && room.roomId
+    room?.media && room.roomId && serverUrl
       ? buildMediaUrl(serverUrl, room.roomId, room.media.id)
       : null
   const audienceCount = room?.members.length ?? 0
@@ -174,6 +226,24 @@ function App() {
   useEffect(() => {
     roomRef.current = room
   }, [room])
+
+  useEffect(() => {
+    if (!window.desktopApp?.relay) {
+      return
+    }
+
+    void window.desktopApp.relay.status().then((status) => {
+      setRelayStatus(status)
+
+      if (status.localUrl && !serverUrl) {
+        setServerUrl(status.localUrl)
+      }
+
+      if (!shareUrl && status.shareUrls.length > 0) {
+        setShareUrl(status.shareUrls[0])
+      }
+    })
+  }, [serverUrl, shareUrl])
 
   const suppressLocalPlaybackEvents = useCallback((duration = 300) => {
     suppressEventsRef.current = true
@@ -346,11 +416,41 @@ function App() {
     })
   }
 
-  const connectToRoom = async (desiredRoomId: string) => {
+  const ensureLocalRelay = async () => {
+    if (!window.desktopApp?.relay) {
+      throw new Error('当前环境没有桌面端直连能力')
+    }
+
+    const status = await window.desktopApp.relay.start()
+    setRelayStatus({
+      running: true,
+      port: status.port,
+      localUrl: status.localUrl,
+      shareUrls: status.shareUrls,
+      allUrls: status.allUrls,
+    })
+    setServerUrl(status.localUrl)
+
+    if (status.shareUrls.length > 0) {
+      setShareUrl(status.shareUrls[0])
+    }
+
+    return status
+  }
+
+  const connectToRoom = async (
+    desiredRoomId: string,
+    overrideServerUrl?: string,
+  ) => {
     const resolvedRoomId = normalizeRoomId(desiredRoomId) || createRoomCode()
     const resolvedNickname =
       nickname.trim() || `Viewer-${Math.floor(Math.random() * 90 + 10)}`
-    const resolvedServerUrl = normalizeServerUrl(serverUrl)
+    const resolvedServerUrl = normalizeServerUrl(overrideServerUrl ?? serverUrl)
+
+    if (!resolvedServerUrl) {
+      setErrorMessage('请先填房主的直连地址，或由房主先启动本机分享服务')
+      return
+    }
 
     setServerUrl(resolvedServerUrl)
     setRoomInput(resolvedRoomId)
@@ -400,7 +500,7 @@ function App() {
     })
 
     nextSocket.on('connect_error', (error: Error) => {
-      setErrorMessage(error.message || '连接服务器失败')
+      setErrorMessage(error.message || '无法连接房主设备')
       setConnectionState('idle')
     })
 
@@ -448,7 +548,7 @@ function App() {
     setAutoplayBlocked(false)
     setUploadStatus('idle')
     setUploadProgress(0)
-    setUploadLabel('等待上传')
+    setUploadLabel('等待导入')
     setSelectedFileName('')
     socketRef.current?.removeAllListeners()
     socketRef.current?.disconnect()
@@ -466,6 +566,37 @@ function App() {
       window.setTimeout(() => setRoomCodeCopied(false), 1600)
     } catch {
       setErrorMessage('复制房间号失败，请手动发送给对方')
+    }
+  }
+
+  const copyInvite = async () => {
+    if (!room?.roomId || !shareUrl) {
+      setErrorMessage('请先启动本机分享服务并创建房间')
+      return
+    }
+
+    const token = encodeInvite({
+      roomId: room.roomId,
+      serverUrl: shareUrl,
+    })
+
+    try {
+      await navigator.clipboard.writeText(token)
+      setInviteCopied(true)
+      window.setTimeout(() => setInviteCopied(false), 1600)
+    } catch {
+      setErrorMessage('复制邀请失败，请手动复制分享地址和房间号')
+    }
+  }
+
+  const applyInvite = () => {
+    try {
+      const payload = decodeInvite(inviteInput)
+      setServerUrl(normalizeServerUrl(payload.serverUrl))
+      setRoomInput(normalizeRoomId(payload.roomId))
+      setErrorMessage(null)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '邀请解析失败')
     }
   }
 
@@ -493,7 +624,7 @@ function App() {
     }
 
     setUploadStatus('uploading')
-    setUploadLabel('上传到共享媒体服务')
+    setUploadLabel('复制到房主本机直连服务')
 
     await new Promise<void>((resolve, reject) => {
       const request = new XMLHttpRequest()
@@ -515,12 +646,12 @@ function App() {
         if (request.status >= 200 && request.status < 300) {
           setUploadStatus('done')
           setUploadProgress(100)
-          setUploadLabel('视频已就绪，双方可直接同看')
+          setUploadLabel('片源已挂载，另一端会直接从你机器拉流')
           resolve()
           return
         }
 
-        let message = '上传失败'
+        let message = '导入失败'
 
         try {
           const payload = JSON.parse(request.responseText) as { error?: string }
@@ -533,25 +664,36 @@ function App() {
       }
 
       request.onerror = () => {
-        reject(new Error('上传中断，请检查网络后重试'))
+        reject(new Error('导入中断，请检查本机直连服务'))
       }
 
       request.send(formData)
     }).catch((error: unknown) => {
       setUploadStatus('error')
-      setUploadLabel('上传失败')
-      setErrorMessage(error instanceof Error ? error.message : '上传失败')
+      setUploadLabel('导入失败')
+      setErrorMessage(error instanceof Error ? error.message : '导入失败')
     })
+  }
+
+  const hostAndCreateRoom = async () => {
+    try {
+      const relay = await ensureLocalRelay()
+      await connectToRoom(createRoomCode(), relay.localUrl)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : '启动本机分享服务失败',
+      )
+    }
   }
 
   return (
     <div className="shell">
       <header className="hero">
         <div className="hero__copy">
-          <p className="eyebrow">{getPlatformLabel()} · 双端异地同看</p>
-          <h1>同一份视频源，同一条进度线。</h1>
+          <p className="eyebrow">{getPlatformLabel()} · 局域网 / 蒲公英直连</p>
+          <h1>房主本机直出，对端直接拉流。</h1>
           <p className="hero__lead">
-            房主导入本地电影后，媒体会上传到共享服务，双方从同一份文件流式播放。播放、暂停、拖动和缓冲状态都会同步。
+            这版按同一局域网或虚拟局域网设计。房主设备本身就是分享节点，不经过第三方中转服务器；另一端直接连接房主的 VPN/LAN 地址观看同一部电影。
           </p>
         </div>
 
@@ -561,8 +703,8 @@ function App() {
             <strong>macOS / Windows</strong>
           </div>
           <div className="hero-card">
-            <span>房间容量</span>
-            <strong>{MAX_ROOM_MEMBERS} 人</strong>
+            <span>连接方式</span>
+            <strong>P2P 局域网直连</strong>
           </div>
           <div className="hero-card">
             <span>同步模式</span>
@@ -575,8 +717,8 @@ function App() {
         <section className="panel panel--lobby">
           <div className="panel__header">
             <div>
-              <p className="panel__eyebrow">Room</p>
-              <h2>连接配置</h2>
+              <p className="panel__eyebrow">Direct Link</p>
+              <h2>直连配置</h2>
             </div>
             <StatusPill
               tone={
@@ -584,25 +726,104 @@ function App() {
                   ? 'success'
                   : connectionState === 'reconnecting'
                     ? 'warning'
-                    : 'neutral'
+                    : relayStatus.running
+                      ? 'accent'
+                      : 'neutral'
               }
             >
               {connectionState === 'connected'
-                ? '已连接'
+                ? '观影已连接'
                 : connectionState === 'reconnecting'
-                  ? '重连中'
-                  : connectionState === 'connecting'
-                    ? '连接中'
-                    : '未连接'}
+                  ? '房间重连中'
+                  : relayStatus.running
+                    ? '本机分享中'
+                    : '待启动'}
             </StatusPill>
           </div>
 
+          <div className="panel-block">
+            <div className="panel-block__title">
+              <h3>房主模式</h3>
+              <StatusPill tone={relayStatus.running ? 'success' : 'neutral'}>
+                {relayStatus.running ? '已启动' : '未启动'}
+              </StatusPill>
+            </div>
+
+            <div className="actions">
+              <button className="button button--primary" onClick={() => void hostAndCreateRoom()}>
+                启动本机分享并建房
+              </button>
+              <button
+                className="button button--secondary"
+                onClick={() => {
+                  void window.desktopApp?.relay.stop().then(() => {
+                    setRelayStatus(EMPTY_RELAY_STATUS)
+                    if (!room) {
+                      setServerUrl('')
+                    }
+                  })
+                }}
+              >
+                停止本机分享
+              </button>
+            </div>
+
+            <div className="room-card">
+              <div className="room-card__row">
+                <span>本机连接地址</span>
+                <strong>{relayStatus.localUrl ?? '未启动'}</strong>
+              </div>
+              <div className="room-card__row">
+                <span>推荐分享地址</span>
+                <strong>{shareUrl || '未检测到外部地址'}</strong>
+              </div>
+              {relayStatus.shareUrls.length > 1 ? (
+                <p className="hint">
+                  检测到多个网卡地址：{relayStatus.shareUrls.join(' / ')}
+                </p>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="panel-block">
+            <div className="panel-block__title">
+              <h3>加入模式</h3>
+              <StatusPill tone="accent">对端直连</StatusPill>
+            </div>
+
+            <label className="field">
+              <span>邀请串</span>
+              <textarea
+                className="field__textarea"
+                value={inviteInput}
+                onChange={(event) => setInviteInput(event.target.value)}
+                placeholder="贴入房主复制给你的邀请串"
+              />
+            </label>
+
+            <div className="actions actions--tight">
+              <button className="button button--secondary" onClick={applyInvite}>
+                解析邀请
+              </button>
+              <button
+                className="button button--secondary"
+                onClick={() => {
+                  void navigator.clipboard.readText().then((text) => {
+                    setInviteInput(text)
+                  })
+                }}
+              >
+                粘贴剪贴板
+              </button>
+            </div>
+          </div>
+
           <label className="field">
-            <span>同步服务器</span>
+            <span>房主地址</span>
             <input
               value={serverUrl}
               onChange={(event) => setServerUrl(event.target.value)}
-              placeholder="http://localhost:4000"
+              placeholder="例如 http://100.64.0.12:4000"
               disabled={connectionState === 'connecting'}
             />
           </label>
@@ -631,18 +852,13 @@ function App() {
             <button
               className="button button--primary"
               onClick={() => {
-                void connectToRoom(createRoomCode())
-              }}
-            >
-              新建房间
-            </button>
-            <button
-              className="button button--secondary"
-              onClick={() => {
                 void connectToRoom(roomInput)
               }}
             >
-              加入房间
+              连接房主
+            </button>
+            <button className="button button--ghost" onClick={disconnectFromRoom}>
+              断开连接
             </button>
           </div>
 
@@ -673,16 +889,18 @@ function App() {
                   {roomCodeCopied ? '已复制房间号' : '复制房间号'}
                 </button>
                 <button
-                  className="button button--ghost"
-                  onClick={disconnectFromRoom}
+                  className="button button--secondary"
+                  onClick={() => {
+                    void copyInvite()
+                  }}
                 >
-                  断开连接
+                  {inviteCopied ? '已复制邀请' : '复制邀请串'}
                 </button>
               </div>
             </div>
           ) : (
             <p className="hint">
-              双方先连到同一个同步服务器，再通过房间号碰头。房主随后导入本地视频，另一端会自动拿到同一份播放源。
+              推荐流程是：双方先用蒲公英等工具进入同一虚拟局域网；房主点击“启动本机分享并建房”，把邀请串发给另一方；另一方解析后直接连接。
             </p>
           )}
 
@@ -708,9 +926,9 @@ function App() {
                     event.target.value = ''
                   }}
                 />
-                <span>选择一部本地电影导入房间</span>
+                <span>选择一部本地电影挂到你的分享节点</span>
                 <strong>
-                  {selectedFileName || '支持 mp4 / mkv / mov 等常见视频格式'}
+                  {selectedFileName || '推荐在组网稳定后导入 mp4 / mkv / mov 文件'}
                 </strong>
               </label>
 
@@ -813,10 +1031,10 @@ function App() {
             </div>
             <div className="player-badges">
               <StatusPill tone={room?.media ? 'success' : 'neutral'}>
-                {room?.media ? '视频已加载' : '等待房主导入'}
+                {room?.media ? '片源已挂载' : '等待房主导入'}
               </StatusPill>
               <StatusPill tone={localBuffering ? 'warning' : 'accent'}>
-                {localBuffering ? '本地缓冲中' : '播放链路稳定'}
+                {localBuffering ? '本地缓冲中' : '直连链路稳定'}
               </StatusPill>
             </div>
           </div>
@@ -866,9 +1084,7 @@ function App() {
               <div className="video video--placeholder">
                 <div>
                   <p>还没有共享视频</p>
-                  <strong>
-                    房主上传后，双方都会从同一份源文件开始播放。
-                  </strong>
+                  <strong>房主导入后，另一端会直接从房主设备拉取同一份片源。</strong>
                 </div>
               </div>
             )}
@@ -884,13 +1100,13 @@ function App() {
           <div className="media-meta">
             <article className="meta-card">
               <span>当前片源</span>
-              <strong>{room?.media?.name ?? '未上传'}</strong>
+              <strong>{room?.media?.name ?? '未导入'}</strong>
               <p>
                 {room?.media
                   ? `${formatBytes(room.media.size)} · ${formatDuration(
                       room.media.duration ?? 0,
                     )}`
-                  : '等待房主导入本地视频'}
+                  : '等待房主挂载本地视频'}
               </p>
             </article>
             <article className="meta-card">
@@ -899,16 +1115,16 @@ function App() {
               <p>
                 {playback?.playbackState.paused
                   ? '当前为暂停态'
-                  : '正在按服务端时间轴推进'}
+                  : '正在按房主时间轴推进'}
               </p>
             </article>
             <article className="meta-card">
-              <span>网络策略</span>
-              <strong>{syncModeLabel}</strong>
+              <span>直连信息</span>
+              <strong>{shareUrl || serverUrl || '待连接'}</strong>
               <p>
-                {syncMode === 'strict'
-                  ? '任一端卡顿会暂停全员'
-                  : '卡顿端恢复后自动追平时间轴'}
+                {isHost
+                  ? '对端会直接连接你的设备'
+                  : '当前直接连接房主设备，不经过第三方中转'}
               </p>
             </article>
           </div>

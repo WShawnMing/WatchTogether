@@ -5,9 +5,7 @@
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:desktop\"",
-    "dev:desktop": "vite",
-    "dev:server": "tsx watch server/src/index.ts",
+    "dev": "vite",
     "typecheck": "tsc -b && tsc -p server/tsconfig.json --noEmit",
     "build": "npm run typecheck && npm run build:desktop && npm run build:server",
     "build:desktop": "vite build",
