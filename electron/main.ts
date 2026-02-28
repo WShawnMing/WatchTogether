@@ -81,6 +81,13 @@ function intToIp(value: number) {
   ].join('.')
 }
 
+function isInIpv4Range(value: string, base: string, prefix: number) {
+  const mask =
+    prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0)
+
+  return (ipToInt(value) & mask) >>> 0 === (ipToInt(base) & mask) >>> 0
+}
+
 function getBroadcastAddresses() {
   const broadcasts = new Set<string>(['255.255.255.255'])
 
@@ -118,18 +125,15 @@ function getReachableUrls(port: number) {
   return [...urls]
 }
 
-function isPrivateIPv4(value: string) {
-  if (value.startsWith('10.')) {
-    return true
-  }
-
-  if (value.startsWith('192.168.')) {
-    return true
-  }
-
-  const [first, second] = value.split('.').map(Number)
-
-  return first === 172 && second >= 16 && second <= 31
+function isLanLikeIPv4(value: string) {
+  return (
+    isInIpv4Range(value, '10.0.0.0', 8) ||
+    isInIpv4Range(value, '172.16.0.0', 12) ||
+    isInIpv4Range(value, '192.168.0.0', 16) ||
+    isInIpv4Range(value, '100.64.0.0', 10) ||
+    isInIpv4Range(value, '169.254.0.0', 16) ||
+    isInIpv4Range(value, '198.18.0.0', 15)
+  )
 }
 
 function prefixLengthFromNetmask(netmask: string) {
@@ -161,7 +165,7 @@ function getProbeAddresses() {
         address.family !== 'IPv4' ||
         address.internal ||
         !address.netmask ||
-        !isPrivateIPv4(address.address)
+        !isLanLikeIPv4(address.address)
       ) {
         continue
       }
