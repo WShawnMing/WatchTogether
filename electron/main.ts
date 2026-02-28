@@ -7,6 +7,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 process.env.WS_NO_BUFFER_UTIL = '1'
 process.env.WS_NO_UTF_8_VALIDATE = '1'
 let relayHandle: LocalRelayHandle | null = null
+let relayStartPromise: Promise<LocalRelayHandle> | null = null
+let relayStopPromise: Promise<void> | null = null
 
 type LocalRelayHandle = {
   close: () => Promise<void>
@@ -15,6 +17,57 @@ type LocalRelayHandle = {
 
 async function loadLocalRelay() {
   return import('../server/src/localRelay')
+}
+
+async function ensureRelay(preferredPort?: number) {
+  if (relayHandle) {
+    return relayHandle
+  }
+
+  if (relayStartPromise) {
+    return relayStartPromise
+  }
+
+  relayStartPromise = (async () => {
+    const { startLocalRelay } = await loadLocalRelay()
+
+    return startLocalRelay({
+      port: preferredPort,
+      roomIdleTtlMinutes: Number(process.env.ROOM_IDLE_TTL_MINUTES ?? 120),
+      storageRoot: path.join(app.getPath('userData'), 'uploads'),
+    })
+  })()
+
+  try {
+    relayHandle = await relayStartPromise
+    return relayHandle
+  } finally {
+    relayStartPromise = null
+  }
+}
+
+async function stopRelay() {
+  if (relayStopPromise) {
+    await relayStopPromise
+    return
+  }
+
+  const activeHandle = relayHandle
+  relayHandle = null
+
+  if (!activeHandle) {
+    return
+  }
+
+  relayStopPromise = (async () => {
+    await activeHandle.close()
+  })()
+
+  try {
+    await relayStopPromise
+  } finally {
+    relayStopPromise = null
+  }
 }
 
 function getReachableUrls(port: number) {
@@ -56,21 +109,13 @@ function createMainWindow() {
 }
 
 ipcMain.handle('relay:start', async (_event, preferredPort?: number) => {
-  if (!relayHandle) {
-    const { startLocalRelay } = await loadLocalRelay()
+  const activeRelay = await ensureRelay(preferredPort)
 
-    relayHandle = await startLocalRelay({
-      port: preferredPort,
-      roomIdleTtlMinutes: Number(process.env.ROOM_IDLE_TTL_MINUTES ?? 120),
-      storageRoot: path.join(app.getPath('userData'), 'uploads'),
-    })
-  }
-
-  const urls = getReachableUrls(relayHandle.port)
+  const urls = getReachableUrls(activeRelay.port)
 
   return {
-    port: relayHandle.port,
-    localUrl: `http://127.0.0.1:${relayHandle.port}`,
+    port: activeRelay.port,
+    localUrl: `http://127.0.0.1:${activeRelay.port}`,
     shareUrls: urls.filter((url) => !url.includes('127.0.0.1')),
     allUrls: urls,
   }
@@ -81,8 +126,7 @@ ipcMain.handle('relay:stop', async () => {
     return { ok: true }
   }
 
-  await relayHandle.close()
-  relayHandle = null
+  await stopRelay()
 
   return { ok: true }
 })
@@ -126,6 +170,5 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  void relayHandle?.close()
-  relayHandle = null
+  void stopRelay()
 })

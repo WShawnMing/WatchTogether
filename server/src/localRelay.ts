@@ -61,6 +61,8 @@ export async function startLocalRelay(
   const uploadRoot = path.resolve(
     options.storageRoot ?? process.env.WATCH_TOGETHER_STORAGE_DIR ?? '.watchtogether/uploads',
   )
+  let isClosed = false
+  let closePromise: Promise<void> | null = null
 
   mkdirSync(uploadRoot, { recursive: true })
 
@@ -612,9 +614,13 @@ export async function startLocalRelay(
   }
 
   async function closeServer(server: HttpServer) {
+    if (!server.listening) {
+      return
+    }
+
     await new Promise<void>((resolve, reject) => {
       server.close((error) => {
-        if (error) {
+        if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
           reject(error)
           return
         }
@@ -624,19 +630,44 @@ export async function startLocalRelay(
     })
   }
 
+  async function closeIoServer(server: Server) {
+    await new Promise<void>((resolve) => {
+      server.close(() => {
+        resolve()
+      })
+    })
+  }
+
   return {
     port: address.port,
     close: async () => {
-      clearInterval(playbackTimer)
-      clearInterval(cleanupTimer)
-
-      for (const roomId of rooms.keys()) {
-        deleteRoom(roomId)
+      if (isClosed) {
+        return
       }
 
-      io.removeAllListeners()
-      await io.close()
-      await closeServer(httpServer)
+      if (closePromise) {
+        return closePromise
+      }
+
+      closePromise = (async () => {
+        clearInterval(playbackTimer)
+        clearInterval(cleanupTimer)
+
+        for (const roomId of [...rooms.keys()]) {
+          deleteRoom(roomId)
+        }
+
+        io.removeAllListeners()
+        await closeIoServer(io)
+        await closeServer(httpServer)
+        isClosed = true
+      })()
+
+      try {
+        await closePromise
+      } finally {
+        closePromise = null
+      }
     },
   }
 }

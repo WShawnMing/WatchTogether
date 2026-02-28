@@ -198,6 +198,7 @@ function App() {
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadLabel, setUploadLabel] = useState('等待导入')
   const [selectedFileName, setSelectedFileName] = useState('')
+  const [relayBusy, setRelayBusy] = useState(false)
 
   const socketRef = useRef<Socket | null>(null)
   const roomRef = useRef<RoomSnapshot | null>(null)
@@ -677,12 +678,39 @@ function App() {
 
   const hostAndCreateRoom = async () => {
     try {
+      setRelayBusy(true)
       const relay = await ensureLocalRelay()
       await connectToRoom(createRoomCode(), relay.localUrl)
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : '启动本机分享服务失败',
       )
+    } finally {
+      setRelayBusy(false)
+    }
+  }
+
+  const stopHosting = async () => {
+    if (!window.desktopApp?.relay) {
+      setErrorMessage('当前环境没有桌面端直连能力')
+      return
+    }
+
+    setRelayBusy(true)
+    setErrorMessage(null)
+
+    try {
+      disconnectFromRoom()
+      await window.desktopApp.relay.stop()
+      setRelayStatus(EMPTY_RELAY_STATUS)
+      setShareUrl('')
+      setServerUrl('')
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : '停止本机分享失败',
+      )
+    } finally {
+      setRelayBusy(false)
     }
   }
 
@@ -750,19 +778,17 @@ function App() {
             </div>
 
             <div className="actions">
-              <button className="button button--primary" onClick={() => void hostAndCreateRoom()}>
-                启动本机分享并建房
+              <button
+                className="button button--primary"
+                onClick={() => void hostAndCreateRoom()}
+                disabled={relayBusy}
+              >
+                {relayBusy ? '处理中...' : '启动本机分享并建房'}
               </button>
               <button
                 className="button button--secondary"
-                onClick={() => {
-                  void window.desktopApp?.relay.stop().then(() => {
-                    setRelayStatus(EMPTY_RELAY_STATUS)
-                    if (!room) {
-                      setServerUrl('')
-                    }
-                  })
-                }}
+                onClick={() => void stopHosting()}
+                disabled={relayBusy || !relayStatus.running}
               >
                 停止本机分享
               </button>
