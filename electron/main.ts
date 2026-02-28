@@ -7,14 +7,19 @@ import { fileURLToPath } from 'node:url'
 import type {
   DiscoveryAdvertisePayload,
   DiscoveryAnnouncement,
+  DiscoveryProbeResponse,
   DiscoverySession,
 } from '../shared/protocol.js'
+import { DEFAULT_RELAY_PORT } from '../shared/protocol.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APP_INSTANCE_ID = randomUUID()
 const DISCOVERY_PORT = Number(process.env.WATCH_TOGETHER_DISCOVERY_PORT ?? 43153)
 const DISCOVERY_INTERVAL_MS = 1_500
 const DISCOVERY_TTL_MS = 4_500
+const DISCOVERY_PROBE_CACHE_MS = 8_000
+const DISCOVERY_PROBE_TIMEOUT_MS = 450
+const DISCOVERY_PROBE_CONCURRENCY = 24
 const APP_DISPLAY_NAME = 'WatchTogether'
 
 process.env.WS_NO_BUFFER_UTIL = '1'
@@ -35,6 +40,9 @@ let discoverySocketPromise: Promise<DiscoverySocket> | null = null
 let discoveryBroadcastTimer: NodeJS.Timeout | null = null
 let discoveryCleanupTimer: NodeJS.Timeout | null = null
 let hostedDiscovery: DiscoveryAdvertisePayload | null = null
+let discoveryProbePromise: Promise<Map<string, DiscoverySession>> | null = null
+let lastDiscoveryProbeAt = 0
+let cachedProbeSessions = new Map<string, DiscoverySession>()
 
 const discoveredSessions = new Map<string, DiscoverySession>()
 
@@ -107,6 +115,175 @@ function getReachableUrls(port: number) {
   }
 
   return [...urls]
+}
+
+function isPrivateIPv4(value: string) {
+  if (value.startsWith('10.')) {
+    return true
+  }
+
+  if (value.startsWith('192.168.')) {
+    return true
+  }
+
+  const [first, second] = value.split('.').map(Number)
+
+  return first === 172 && second >= 16 && second <= 31
+}
+
+function prefixLengthFromNetmask(netmask: string) {
+  return netmask
+    .split('.')
+    .map((chunk) => Number(chunk).toString(2).padStart(8, '0'))
+    .join('')
+    .replace(/0+$/, '')
+    .length
+}
+
+function getProbeAddresses() {
+  const addresses = new Set<string>()
+  const localAddresses = new Set<string>()
+
+  for (const network of Object.values(os.networkInterfaces())) {
+    for (const address of network ?? []) {
+      if (
+        address.family !== 'IPv4' ||
+        address.internal ||
+        !address.netmask ||
+        !isPrivateIPv4(address.address)
+      ) {
+        continue
+      }
+
+      localAddresses.add(address.address)
+
+      try {
+        const host = ipToInt(address.address)
+        const prefix = prefixLengthFromNetmask(address.netmask)
+        const useActualSubnet = prefix >= 24 && prefix <= 30
+        const mask = useActualSubnet ? ipToInt(address.netmask) : 0xffffff00
+        const networkBase = host & mask
+        const broadcast = (networkBase | (~mask >>> 0)) >>> 0
+
+        for (let candidate = networkBase + 1; candidate < broadcast; candidate += 1) {
+          const ip = intToIp(candidate >>> 0)
+
+          if (!localAddresses.has(ip)) {
+            addresses.add(ip)
+          }
+        }
+      } catch {
+        // Ignore malformed network info.
+      }
+    }
+  }
+
+  return [...addresses]
+}
+
+async function probeAddress(address: string) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => {
+    controller.abort()
+  }, DISCOVERY_PROBE_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(`http://${address}:${DEFAULT_RELAY_PORT}/api/discovery`, {
+      headers: {
+        accept: 'application/json',
+      },
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      return []
+    }
+
+    const payload = (await response.json()) as DiscoveryProbeResponse
+
+    if (
+      payload.protocolVersion !== 1 ||
+      payload.instanceId === APP_INSTANCE_ID ||
+      !Array.isArray(payload.rooms)
+    ) {
+      return []
+    }
+
+    const lastSeenAt = Date.now()
+
+    return payload.rooms.map((room) => ({
+      instanceId: payload.instanceId,
+      roomId: room.roomId,
+      roomName: room.roomName,
+      hostNickname: room.hostNickname,
+      requiresPassword: room.requiresPassword,
+      memberCount: room.memberCount,
+      maxMembers: room.maxMembers,
+      mediaName: room.mediaName,
+      subtitleName: room.subtitleName,
+      playbackState: room.playbackState,
+      serverUrl: `http://${address}:${DEFAULT_RELAY_PORT}`,
+      lastSeenAt,
+    }))
+  } catch {
+    return []
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function refreshProbeSessions(force = false) {
+  const now = Date.now()
+
+  if (!force && now - lastDiscoveryProbeAt < DISCOVERY_PROBE_CACHE_MS) {
+    return cachedProbeSessions
+  }
+
+  if (discoveryProbePromise) {
+    return discoveryProbePromise
+  }
+
+  const addresses = getProbeAddresses()
+
+  discoveryProbePromise = (async () => {
+    const probedSessions = new Map<string, DiscoverySession>()
+
+    if (addresses.length === 0) {
+      lastDiscoveryProbeAt = Date.now()
+      cachedProbeSessions = probedSessions
+      return probedSessions
+    }
+
+    let cursor = 0
+    const workers = Array.from(
+      { length: Math.min(DISCOVERY_PROBE_CONCURRENCY, addresses.length) },
+      async () => {
+        while (cursor < addresses.length) {
+          const address = addresses[cursor]
+          cursor += 1
+
+          const sessions = await probeAddress(address)
+
+          for (const session of sessions) {
+            probedSessions.set(`${session.instanceId}:${session.roomId}`, session)
+          }
+        }
+      },
+    )
+
+    await Promise.all(workers)
+
+    lastDiscoveryProbeAt = Date.now()
+    cachedProbeSessions = probedSessions
+
+    return probedSessions
+  })()
+
+  try {
+    return await discoveryProbePromise
+  } finally {
+    discoveryProbePromise = null
+  }
 }
 
 function buildAnnouncement(
@@ -272,8 +449,9 @@ async function ensureRelay(preferredPort?: number) {
     const { startLocalRelay } = await loadLocalRelay()
 
     return startLocalRelay({
-      port: preferredPort,
+      port: preferredPort ?? DEFAULT_RELAY_PORT,
       roomIdleTtlMinutes: Number(process.env.ROOM_IDLE_TTL_MINUTES ?? 120),
+      instanceId: APP_INSTANCE_ID,
       storageRoot: path.join(app.getPath('userData'), 'uploads'),
     })
   })()
@@ -431,8 +609,18 @@ ipcMain.handle(
 ipcMain.handle('discovery:list', async () => {
   await ensureDiscoverySocket()
   cleanupDiscoveredSessions()
+  const probeSessions = await refreshProbeSessions()
+  const mergedSessions = new Map(discoveredSessions)
 
-  return [...discoveredSessions.values()].sort((left, right) => {
+  for (const [key, session] of probeSessions.entries()) {
+    const current = mergedSessions.get(key)
+
+    if (!current || session.lastSeenAt >= current.lastSeenAt) {
+      mergedSessions.set(key, session)
+    }
+  }
+
+  return [...mergedSessions.values()].sort((left, right) => {
     return right.lastSeenAt - left.lastSeenAt
   })
 })

@@ -121,6 +121,17 @@ function formatPresenceSummary(names: string[], verb: '加入' | '离开') {
   return `${names[0]}、${names[1]} 等 ${names.length} 人${verb}了房间`
 }
 
+function isTypingTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false
+  }
+
+  return (
+    target.isContentEditable ||
+    ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+  )
+}
+
 function buildMediaUrl(serverUrl: string, roomId: string, mediaId: string) {
   return new URL(
     `/api/rooms/${roomId}/media/${mediaId}`,
@@ -265,6 +276,7 @@ function App() {
   const [scrubValue, setScrubValue] = useState(0)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
+  const [showPlayerControls, setShowPlayerControls] = useState(true)
   const [presenceToasts, setPresenceToasts] = useState<PresenceToast[]>([])
 
   const socketRef = useRef<Socket | null>(null)
@@ -277,6 +289,7 @@ function App() {
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
   const suppressEventsRef = useRef(false)
   const suppressTimeoutRef = useRef<number | null>(null)
+  const controlsHideTimeoutRef = useRef<number | null>(null)
   const localBufferingRef = useRef(false)
   const manualDisconnectRef = useRef(false)
   const toastTimersRef = useRef<Map<string, number>>(new Map())
@@ -327,6 +340,20 @@ function App() {
   const mediaButtonMeta = selectedFileName || room?.media?.name || 'MP4 / MKV / MOV'
   const subtitleButtonMeta =
     selectedSubtitleName || room?.subtitle?.name || '.srt / .vtt / .ass'
+  const seekFillPercentage =
+    effectiveDuration > 0
+      ? Math.max(
+          0,
+          Math.min((displayedCurrentTime / effectiveDuration) * 100, 100),
+        )
+      : 0
+  const playerControlsVisible =
+    !isFullscreen ||
+    showPlayerControls ||
+    subtitlePanelOpen ||
+    isScrubbing ||
+    videoPaused ||
+    autoplayBlocked
 
   useEffect(() => {
     roomRef.current = room
@@ -474,6 +501,43 @@ function App() {
     }, duration)
   }, [])
 
+  const clearPlayerControlsHideTimer = useCallback(() => {
+    if (controlsHideTimeoutRef.current !== null) {
+      window.clearTimeout(controlsHideTimeoutRef.current)
+      controlsHideTimeoutRef.current = null
+    }
+  }, [])
+
+  const revealPlayerControls = useCallback(
+    (delay = 2_200) => {
+      setShowPlayerControls(true)
+      clearPlayerControlsHideTimer()
+
+      if (
+        !isFullscreen ||
+        subtitlePanelOpen ||
+        isScrubbing ||
+        videoPaused ||
+        autoplayBlocked
+      ) {
+        return
+      }
+
+      controlsHideTimeoutRef.current = window.setTimeout(() => {
+        setShowPlayerControls(false)
+        controlsHideTimeoutRef.current = null
+      }, delay)
+    },
+    [
+      autoplayBlocked,
+      clearPlayerControlsHideTimer,
+      isFullscreen,
+      isScrubbing,
+      subtitlePanelOpen,
+      videoPaused,
+    ],
+  )
+
   const applyRemotePlayback = useCallback(
     (incoming: PlaybackEnvelope) => {
       const video = videoRef.current
@@ -562,6 +626,146 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!mediaUrl) {
+      clearPlayerControlsHideTimer()
+      setShowPlayerControls(true)
+      return
+    }
+
+    if (
+      !isFullscreen ||
+      subtitlePanelOpen ||
+      isScrubbing ||
+      videoPaused ||
+      autoplayBlocked
+    ) {
+      clearPlayerControlsHideTimer()
+      setShowPlayerControls(true)
+      return
+    }
+
+    revealPlayerControls()
+  }, [
+    autoplayBlocked,
+    clearPlayerControlsHideTimer,
+    isFullscreen,
+    isScrubbing,
+    mediaUrl,
+    revealPlayerControls,
+    subtitlePanelOpen,
+    videoPaused,
+  ])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!mediaUrl || event.metaKey || event.ctrlKey || event.altKey) {
+        return
+      }
+
+      if (isTypingTarget(event.target)) {
+        return
+      }
+
+      const video = videoRef.current
+
+      if (!video) {
+        return
+      }
+
+      const key = event.key.toLowerCase()
+
+      if (key === ' ' || key === 'k') {
+        event.preventDefault()
+        revealPlayerControls()
+        if (video.paused) {
+          void video.play().then(
+            () => {
+              setAutoplayBlocked(false)
+            },
+            () => {
+              setAutoplayBlocked(true)
+            },
+          )
+        } else {
+          video.pause()
+        }
+        return
+      }
+
+      if (key === 'f') {
+        event.preventDefault()
+        revealPlayerControls()
+        const playerFrame = playerFrameRef.current
+
+        if (!playerFrame) {
+          return
+        }
+
+        void (document.fullscreenElement
+          ? document.exitFullscreen()
+          : playerFrame.requestFullscreen())
+          .then(() => {
+            playerFrame.focus()
+          })
+          .catch(() => {
+            setErrorMessage('切换全屏失败')
+          })
+        return
+      }
+
+      if (key === 'm') {
+        event.preventDefault()
+        revealPlayerControls()
+        video.muted = !video.muted
+        setIsMuted(video.muted)
+        return
+      }
+
+      if (key === 'arrowleft' || key === 'j') {
+        event.preventDefault()
+        revealPlayerControls()
+        const delta = key === 'j' ? -10 : -5
+        video.currentTime = Math.max(0, video.currentTime + delta)
+        setVideoCurrentTime(video.currentTime)
+        publishPlaybackIntent('user')
+        return
+      }
+
+      if (key === 'arrowright' || key === 'l') {
+        event.preventDefault()
+        revealPlayerControls()
+        const duration = Number.isFinite(video.duration)
+          ? video.duration
+          : effectiveDuration
+        const delta = key === 'l' ? 10 : 5
+        video.currentTime = Math.min(duration || video.currentTime + delta, video.currentTime + delta)
+        setVideoCurrentTime(video.currentTime)
+        publishPlaybackIntent('user')
+        return
+      }
+
+      if (key === 'arrowup' || key === 'arrowdown') {
+        event.preventDefault()
+        revealPlayerControls()
+        const delta = key === 'arrowup' ? 0.05 : -0.05
+        const nextVolume = Math.max(0, Math.min(1, video.volume + delta))
+        video.muted = false
+        video.volume = nextVolume
+        if (nextVolume === 0) {
+          video.muted = true
+        }
+        setIsMuted(video.muted || nextVolume === 0)
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [effectiveDuration, mediaUrl, revealPlayerControls])
+
+  useEffect(() => {
     if (!room?.subtitle) {
       setSubtitlePanelOpen(false)
     }
@@ -634,6 +838,10 @@ function App() {
     return () => {
       if (suppressTimeoutRef.current !== null) {
         window.clearTimeout(suppressTimeoutRef.current)
+      }
+
+      if (controlsHideTimeoutRef.current !== null) {
+        window.clearTimeout(controlsHideTimeoutRef.current)
       }
 
       for (const timer of toastTimers.values()) {
@@ -1172,7 +1380,7 @@ function App() {
     }
   }
 
-  const togglePlayback = async () => {
+  const togglePlayback = useCallback(async () => {
     const video = videoRef.current
 
     if (!video) {
@@ -1191,20 +1399,21 @@ function App() {
     }
 
     video.pause()
-  }
+  }, [])
 
-  const toggleMute = () => {
+  const toggleMute = useCallback(() => {
     const video = videoRef.current
 
     if (!video) {
       return
     }
 
+    revealPlayerControls()
     video.muted = !video.muted
     setIsMuted(video.muted)
-  }
+  }, [revealPlayerControls])
 
-  const toggleFullscreen = async () => {
+  const toggleFullscreen = useCallback(async () => {
     const playerFrame = playerFrameRef.current
 
     if (!playerFrame) {
@@ -1217,10 +1426,12 @@ function App() {
       } else {
         await playerFrame.requestFullscreen()
       }
+      playerFrame.focus()
+      revealPlayerControls()
     } catch {
       setErrorMessage('切换全屏失败')
     }
-  }
+  }, [revealPlayerControls])
 
   const handleSeekChange = (nextValue: number) => {
     const video = videoRef.current
@@ -1228,6 +1439,7 @@ function App() {
     setIsScrubbing(true)
     setScrubValue(nextValue)
     setVideoCurrentTime(nextValue)
+    revealPlayerControls()
 
     if (!video) {
       return
@@ -1588,7 +1800,31 @@ function App() {
               <p className="support-note">{formatSupportHint(room?.media?.name)}</p>
             )}
 
-            <div className="player-frame" ref={playerFrameRef}>
+            <div
+              className={`player-frame ${
+                isFullscreen ? 'player-frame--fullscreen' : ''
+              } ${
+                playerControlsVisible ? '' : 'player-frame--controls-hidden'
+              }`}
+              ref={playerFrameRef}
+              onFocus={() => {
+                revealPlayerControls()
+              }}
+              onMouseMove={() => {
+                revealPlayerControls()
+              }}
+              onMouseLeave={() => {
+                if (isFullscreen && !videoPaused && !subtitlePanelOpen && !isScrubbing) {
+                  clearPlayerControlsHideTimer()
+                  setShowPlayerControls(false)
+                }
+              }}
+              onMouseDown={() => {
+                playerFrameRef.current?.focus()
+                revealPlayerControls()
+              }}
+              tabIndex={0}
+            >
               <div className="player-stage">
                 {mediaUrl ? (
                   <video
@@ -1711,10 +1947,10 @@ function App() {
                 )}
 
                 <div
-                  ref={subtitleLayerRef}
                   className={`subtitle-layer ${
                     subtitleFormat === 'ass' ? 'subtitle-layer--active' : ''
                   }`}
+                  ref={subtitleLayerRef}
                   style={
                     {
                       '--subtitle-scale': subtitleScale,
@@ -1754,6 +1990,11 @@ function App() {
                     min="0"
                     max={Math.max(effectiveDuration, 0.1)}
                     step="0.1"
+                    style={
+                      {
+                        '--seek-fill': `${seekFillPercentage}%`,
+                      } as CSSProperties
+                    }
                     value={displayedCurrentTime}
                     onMouseDown={() => {
                       setIsScrubbing(true)

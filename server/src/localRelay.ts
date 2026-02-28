@@ -17,10 +17,12 @@ import { Server } from 'socket.io'
 import {
   createInitialPlaybackState,
   createRoomCode,
+  DEFAULT_RELAY_PORT,
   deriveCurrentPosition,
   MAX_ROOM_MEMBERS,
   normalizeRoomId,
   type BufferingPayload,
+  type DiscoveryProbeResponse,
   type JoinRoomPayload,
   type JoinRoomResult,
   type MediaSnapshot,
@@ -65,6 +67,7 @@ interface StartLocalRelayOptions {
   port?: number
   roomIdleTtlMinutes?: number
   storageRoot?: string
+  instanceId?: string
 }
 
 export async function startLocalRelay(
@@ -437,6 +440,14 @@ export async function startLocalRelay(
     return rooms.get(roomId) ?? null
   }
 
+  function getDiscoveryPlaybackState(room: RoomState) {
+    if (!room.media) {
+      return 'idle' as const
+    }
+
+    return room.playbackState.paused ? ('paused' as const) : ('playing' as const)
+  }
+
   const storage = multer.diskStorage({
     destination: (request, _file, callback) => {
       const rawRoomId = Array.isArray(request.params.roomId)
@@ -487,6 +498,33 @@ export async function startLocalRelay(
       roomCount: rooms.size,
       timestamp: Date.now(),
     })
+  })
+
+  app.get('/api/discovery', (_request, response) => {
+    const payload: DiscoveryProbeResponse = {
+      protocolVersion: 1,
+      instanceId: options.instanceId ?? `local-${DEFAULT_RELAY_PORT}`,
+      rooms: [...rooms.values()]
+        .filter((room) => room.members.size > 0)
+        .map((room) => {
+          const hostMember = room.members.get(room.hostSocketId)
+
+          return {
+            roomId: room.id,
+            roomName: room.roomName,
+            hostNickname: hostMember?.nickname ?? 'Host',
+            requiresPassword: Boolean(room.password),
+            memberCount: room.members.size,
+            maxMembers: MAX_ROOM_MEMBERS,
+            mediaName: room.media?.name ?? null,
+            subtitleName: room.subtitle?.name ?? null,
+            playbackState: getDiscoveryPlaybackState(room),
+          }
+        }),
+    }
+
+    response.setHeader('Cache-Control', 'no-store')
+    response.json(payload)
   })
 
   function resolveHostRoom(request: Request, response: express.Response) {
@@ -883,7 +921,7 @@ export async function startLocalRelay(
 
     httpServer.once('error', onError)
     httpServer.once('listening', onListening)
-    httpServer.listen(options.port ?? 0, '0.0.0.0')
+    httpServer.listen(options.port ?? DEFAULT_RELAY_PORT, '0.0.0.0')
   })
 
   const address = httpServer.address()

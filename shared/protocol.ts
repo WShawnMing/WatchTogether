@@ -3,6 +3,7 @@ export type PlaybackReason = 'user' | 'buffer_lock' | 'media_transfer'
 export type PeerRole = 'host' | 'guest'
 export type DiscoveryPlaybackState = 'idle' | 'paused' | 'playing'
 export const MAX_ROOM_MEMBERS = 6
+export const DEFAULT_RELAY_PORT = 53311
 
 export interface PlaybackState {
   position: number
@@ -124,6 +125,24 @@ export interface DiscoveryAdvertisePayload {
   subtitleName: string | null
   playbackState: DiscoveryPlaybackState
   port: number
+}
+
+export interface DiscoveryProbeRoom {
+  roomId: string
+  roomName: string
+  hostNickname: string
+  requiresPassword: boolean
+  memberCount: number
+  maxMembers: number
+  mediaName: string | null
+  subtitleName: string | null
+  playbackState: DiscoveryPlaybackState
+}
+
+export interface DiscoveryProbeResponse {
+  protocolVersion: 1
+  instanceId: string
+  rooms: DiscoveryProbeRoom[]
 }
 
 export interface DiscoverySession {
