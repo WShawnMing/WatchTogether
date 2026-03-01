@@ -20,6 +20,7 @@ import {
   type DiscoverySession,
   type JoinRoomPayload,
   type JoinRoomResult,
+  type MediaDescriptor,
   type PlaybackEnvelope,
   type PlaybackReason,
   type RoomSnapshot,
@@ -29,6 +30,10 @@ import {
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
 type UploadStatus = 'idle' | 'reading' | 'uploading' | 'done' | 'error'
 type SubtitleStatus = 'idle' | 'uploading' | 'done' | 'error'
+
+interface LocalFileWithPath extends File {
+  path?: string
+}
 
 interface RelayStatus {
   running: boolean
@@ -145,13 +150,6 @@ function isTextEntryTarget(target: EventTarget | null) {
   return false
 }
 
-function buildMediaUrl(serverUrl: string, roomId: string, mediaId: string) {
-  return new URL(
-    `/api/rooms/${roomId}/media/${mediaId}`,
-    `${normalizeServerUrl(serverUrl)}/`,
-  ).toString()
-}
-
 function buildSubtitleUrl(serverUrl: string, roomId: string, subtitleId: string) {
   return new URL(
     `/api/rooms/${roomId}/subtitles/${subtitleId}`,
@@ -201,6 +199,20 @@ function readVideoDuration(file: File) {
   })
 }
 
+async function hashFileSha256(file: LocalFileWithPath) {
+  if (file.path && window.desktopApp?.files) {
+    const result = await window.desktopApp.files.hashSha256(file.path)
+    return result.sha256
+  }
+
+  const buffer = await file.arrayBuffer()
+  const digest = await window.crypto.subtle.digest('SHA-256', buffer)
+
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('')
+}
+
 function getPlaybackLabel(state: DiscoveryPlaybackState) {
   switch (state) {
     case 'playing':
@@ -232,16 +244,16 @@ function buildRoomName(nickname: string) {
 
 function formatSupportHint(mediaName?: string | null) {
   if (!mediaName) {
-    return '推荐 MP4/H.264 最稳；MKV 已允许导入，最终是否可播取决于编码。'
+    return '房主先选择本地片源，其他成员选择相同文件后即可只同步进度，不再传视频。'
   }
 
   const extension = mediaName.split('.').pop()?.toLowerCase() ?? ''
 
   if (['mkv', 'avi', 'wmv'].includes(extension)) {
-    return '当前片源已导入。若无法播放，通常是编码不被内置播放器支持，建议优先使用 H.264/AAC。'
+    return '当前房间只同步进度。若本地无法播放，通常是编码不被内置播放器支持，建议优先使用 H.264/AAC。'
   }
 
-  return '当前格式通常可直接播放。'
+  return '所有成员选择相同本地文件后，只同步时间轴和播放控制。'
 }
 
 function getBufferedAheadSeconds(video: HTMLVideoElement) {
@@ -288,9 +300,21 @@ function getMediaBitrateMbps(size: number, duration: number | null) {
   return (size * 8) / duration / 1_000_000
 }
 
-function getPreparationLabel(room: RoomSnapshot | null, localBuffering: boolean) {
+function getPreparationLabel(
+  room: RoomSnapshot | null,
+  localBuffering: boolean,
+  currentMember: RoomSnapshot['members'][number] | null,
+) {
   if (!room?.media) {
     return '等待片源'
+  }
+
+  if (currentMember?.mediaMatchState === 'missing') {
+    return currentMember.isHost ? '等待选片' : '等待匹配'
+  }
+
+  if (currentMember?.mediaMatchState === 'mismatch') {
+    return '文件不一致'
   }
 
   if (localBuffering) {
@@ -309,6 +333,14 @@ function getPreparationLabel(room: RoomSnapshot | null, localBuffering: boolean)
 }
 
 function getMemberStatusLabel(room: RoomSnapshot | null, member: RoomSnapshot['members'][number]) {
+  if (member.mediaMatchState === 'missing') {
+    return member.isHost ? '待选片' : '待匹配'
+  }
+
+  if (member.mediaMatchState === 'mismatch') {
+    return '不一致'
+  }
+
   if (member.buffering) {
     return '缓冲中'
   }
@@ -348,8 +380,10 @@ function App() {
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>('idle')
   const [uploadProgress, setUploadProgress] = useState(0)
-  const [uploadLabel, setUploadLabel] = useState('还没有选片')
+  const [uploadLabel, setUploadLabel] = useState('还没有选择本地片源')
   const [selectedFileName, setSelectedFileName] = useState('')
+  const [localMediaDescriptor, setLocalMediaDescriptor] = useState<MediaDescriptor | null>(null)
+  const [localMediaUrl, setLocalMediaUrl] = useState<string | null>(null)
   const [subtitleStatus, setSubtitleStatus] =
     useState<SubtitleStatus>('idle')
   const [subtitleLabel, setSubtitleLabel] = useState('还没有字幕')
@@ -383,6 +417,7 @@ function App() {
   const subtitleMenuRef = useRef<HTMLDivElement | null>(null)
   const subtitleLayerRef = useRef<HTMLDivElement | null>(null)
   const assRendererRef = useRef<ASSRenderer | null>(null)
+  const localMediaUrlRef = useRef<string | null>(null)
   const joinPayloadRef = useRef<JoinRoomPayload | null>(null)
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
   const suppressEventsRef = useRef(false)
@@ -408,10 +443,9 @@ function App() {
   const isHost =
     Boolean(currentMember?.isHost) ||
     Boolean(room?.roomId && hostedRoomId && room.roomId === hostedRoomId)
-  const mediaUrl =
-    room?.media && room.roomId && serverUrl
-      ? buildMediaUrl(serverUrl, room.roomId, room.media.id)
-      : null
+  const localMediaMatchesRoom =
+    Boolean(room?.media && localMediaDescriptor && room.media.sha256 === localMediaDescriptor.sha256)
+  const mediaUrl = room?.media && localMediaMatchesRoom ? localMediaUrl : null
   const subtitleUrl =
     room?.subtitle && room.roomId && serverUrl
       ? buildSubtitleUrl(serverUrl, room.roomId, room.subtitle.id)
@@ -427,28 +461,37 @@ function App() {
     connectionState,
     relayStatus.running,
   )
-  const videoKey = `${room?.media?.id ?? 'empty'}:${room?.subtitle?.id ?? 'nosub'}`
+  const videoKey = `${room?.media?.id ?? 'empty'}:${localMediaDescriptor?.sha256 ?? 'nomatch'}:${room?.subtitle?.id ?? 'nosub'}`
   const isMediaUploading = uploadStatus === 'reading' || uploadStatus === 'uploading'
   const isSubtitleUploading = subtitleStatus === 'uploading'
-  const bufferTelemetryLabel = bufferTelemetry.fullyBuffered
-    ? '已缓存完成'
-    : bufferTelemetry.estimatedMbps !== null && bufferTelemetry.realtimeRatio !== null
-      ? `缓存 ${bufferTelemetry.estimatedMbps.toFixed(2)} Mbps · ${bufferTelemetry.realtimeRatio.toFixed(2)}x`
-      : '缓存速率观测中'
+  const bufferTelemetryLabel =
+    room?.media && !localMediaMatchesRoom
+      ? '等待本地匹配'
+      : bufferTelemetry.fullyBuffered
+        ? '已缓存完成'
+        : bufferTelemetry.estimatedMbps !== null && bufferTelemetry.realtimeRatio !== null
+          ? `缓存 ${bufferTelemetry.estimatedMbps.toFixed(2)} Mbps · ${bufferTelemetry.realtimeRatio.toFixed(2)}x`
+          : '缓存速率观测中'
   const bufferTelemetryDetail =
-    bufferTelemetry.fullyBuffered
-      ? '本地已经拿到完整片源缓存'
-      : bufferTelemetry.mediaBitrateMbps !== null &&
-          bufferTelemetry.estimatedMbps !== null
-        ? `片源码率约 ${bufferTelemetry.mediaBitrateMbps.toFixed(1)} Mbps`
-        : '等待更多缓冲样本'
+    room?.media && !localMediaMatchesRoom
+      ? '先选择与房主一致的本地文件'
+      : bufferTelemetry.fullyBuffered
+        ? '本地已经拿到完整片源缓存'
+        : bufferTelemetry.mediaBitrateMbps !== null &&
+            bufferTelemetry.estimatedMbps !== null
+          ? `片源码率约 ${bufferTelemetry.mediaBitrateMbps.toFixed(1)} Mbps`
+          : '等待更多缓冲样本'
   const mediaButtonLabel = isMediaUploading
-    ? '上传影片中...'
+    ? '校验片源中...'
     : uploadStatus === 'done'
-      ? '影片已更新'
+      ? isHost
+        ? '片源已发布'
+        : '已匹配片源'
       : uploadStatus === 'error'
-        ? '重试影片上传'
-        : '选择影片'
+        ? '重试选择片源'
+        : isHost
+          ? '选择本地影片'
+          : '匹配本地影片'
   const subtitleButtonLabel = isSubtitleUploading
     ? '上传字幕中...'
     : subtitleStatus === 'done'
@@ -456,7 +499,10 @@ function App() {
       : subtitleStatus === 'error'
         ? '重试字幕上传'
         : '上传字幕'
-  const mediaButtonMeta = selectedFileName || room?.media?.name || 'MP4 / MKV / MOV'
+  const mediaButtonMeta =
+    selectedFileName ||
+    room?.media?.name ||
+    (isHost ? '选择要分享的本地文件' : '选择与你朋友相同的本地文件')
   const subtitleButtonMeta =
     selectedSubtitleName || room?.subtitle?.name || '.srt / .vtt / .ass'
 
@@ -505,6 +551,14 @@ function App() {
       String(Math.round(subtitleOffsetY)),
     )
   }, [subtitleOffsetY])
+
+  useEffect(() => {
+    return () => {
+      if (localMediaUrlRef.current) {
+        URL.revokeObjectURL(localMediaUrlRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!window.desktopApp?.relay) {
@@ -969,6 +1023,11 @@ function App() {
     const previousRoom = roomRef.current
     const previousMediaId = roomRef.current?.media?.id ?? null
     const nextMediaId = snapshot.media?.id ?? null
+    const nextSelfMember =
+      snapshot.members.find((member) => member.socketId === socketId) ?? null
+    const selfIsHost =
+      Boolean(nextSelfMember?.isHost) ||
+      Boolean(snapshot.roomId && hostedRoomId && snapshot.roomId === hostedRoomId)
 
     if (previousMediaId !== nextMediaId) {
       setAutoplayBlocked(false)
@@ -1054,6 +1113,28 @@ function App() {
     } else {
       setSelectedSubtitleName('')
       setSubtitleLabel('还没有字幕')
+    }
+
+    if (!snapshot.media) {
+      setUploadStatus('idle')
+      setUploadProgress(0)
+      setUploadLabel(selfIsHost ? '请先选择本地片源' : '等待房主选择本地片源')
+    } else if (localMediaDescriptor?.sha256 === snapshot.media.sha256) {
+      setUploadStatus('done')
+      setUploadProgress(100)
+      setUploadLabel(
+        selfIsHost ? '片源指纹已发布，等待成员匹配' : '本地片源已匹配，可参与同步播放',
+      )
+    } else if (nextSelfMember?.mediaMatchState === 'mismatch') {
+      setUploadStatus('error')
+      setUploadProgress(100)
+      setUploadLabel('本地文件与房主片源不一致')
+    } else if (nextSelfMember?.mediaMatchState === 'missing') {
+      setUploadStatus('idle')
+      setUploadProgress(0)
+      setUploadLabel(
+        selfIsHost ? '请先选择本地片源' : '请选择与你朋友相同的本地文件',
+      )
     }
 
     setErrorMessage(null)
@@ -1520,8 +1601,14 @@ function App() {
     setAutoplayBlocked(false)
     setUploadStatus('idle')
     setUploadProgress(0)
-    setUploadLabel('还没有选片')
+    setUploadLabel('还没有选择本地片源')
     setSelectedFileName('')
+    setLocalMediaDescriptor(null)
+    if (localMediaUrlRef.current) {
+      URL.revokeObjectURL(localMediaUrlRef.current)
+      localMediaUrlRef.current = null
+    }
+    setLocalMediaUrl(null)
     setSubtitleStatus('idle')
     setSubtitleLabel('还没有字幕')
     setSelectedSubtitleName('')
@@ -1641,104 +1728,54 @@ function App() {
     const currentRoom = roomRef.current
 
     if (!socket || !currentRoom) {
-      setErrorMessage('请先加入房间，再导入视频')
+      setErrorMessage('请先加入房间，再选择本地片源')
       return
     }
 
     setSelectedFileName(file.name)
     setUploadStatus('reading')
-    setUploadProgress(0)
-    setUploadLabel('读取片源信息')
+    setUploadProgress(15)
+    setUploadLabel('读取本地片源信息')
     setErrorMessage(null)
 
-    const duration = await readVideoDuration(file)
-    const formData = new FormData()
-    formData.append('video', file)
+    try {
+      const duration = await readVideoDuration(file)
+      setUploadStatus('uploading')
+      setUploadProgress(55)
+      setUploadLabel('正在校验本地文件指纹')
+      const sha256 = await hashFileSha256(file as LocalFileWithPath)
+      const nextDescriptor: MediaDescriptor = {
+        id: sha256,
+        name: file.name,
+        size: file.size,
+        mimeType: file.type || 'application/octet-stream',
+        duration,
+        sha256,
+      }
 
-    if (duration !== null) {
-      formData.append('duration', String(duration))
-    }
+      if (localMediaUrlRef.current) {
+        URL.revokeObjectURL(localMediaUrlRef.current)
+      }
 
-    setUploadStatus('uploading')
-    setUploadLabel('正在把片源挂到你的本机共享服务')
-
-    await new Promise<void>((resolve, reject) => {
-      const request = new XMLHttpRequest()
-      request.open(
-        'POST',
-        `${normalizeServerUrl(serverUrl)}/api/rooms/${currentRoom.roomId}/media`,
+      const objectUrl = URL.createObjectURL(file)
+      localMediaUrlRef.current = objectUrl
+      setLocalMediaUrl(objectUrl)
+      setLocalMediaDescriptor(nextDescriptor)
+      setUploadStatus('done')
+      setUploadProgress(100)
+      setUploadLabel(
+        isHost ? '片源指纹已发布，等待其他成员匹配同一文件' : '本地片源已提交校验',
       )
-      request.setRequestHeader('x-socket-id', socket.id ?? '')
 
-      request.upload.onprogress = (event) => {
-        if (!event.lengthComputable) {
-          return
-        }
-
-        setUploadProgress(Math.round((event.loaded / event.total) * 100))
-      }
-
-      request.upload.onload = () => {
-        setUploadProgress(100)
-        setUploadLabel('上传完成，正在生成差网络兼容片源')
-      }
-
-      request.onload = () => {
-        if (request.status >= 200 && request.status < 300) {
-          let optimizedForNetwork = false
-          let sourceBitrateMbps: number | null = null
-
-          try {
-            const payload = JSON.parse(request.responseText) as {
-              optimizedForNetwork?: boolean
-              sourceBitrateMbps?: number | null
-            }
-            optimizedForNetwork = Boolean(payload.optimizedForNetwork)
-            sourceBitrateMbps =
-              typeof payload.sourceBitrateMbps === 'number'
-                ? payload.sourceBitrateMbps
-                : null
-          } catch {
-            // Ignore malformed payloads.
-          }
-
-          setUploadStatus('done')
-          setUploadProgress(100)
-          setUploadLabel(
-            optimizedForNetwork
-              ? `片源已转为兼容版${
-                  sourceBitrateMbps
-                    ? `，原片约 ${sourceBitrateMbps.toFixed(1)} Mbps`
-                    : ''
-                }`
-              : '片源已同步，其他人会直接从你的设备拉流',
-          )
-          resolve()
-          return
-        }
-
-        let message = '导入失败'
-
-        try {
-          const payload = JSON.parse(request.responseText) as { error?: string }
-          message = payload.error ?? message
-        } catch {
-          // Ignore malformed payloads.
-        }
-
-        reject(new Error(message))
-      }
-
-      request.onerror = () => {
-        reject(new Error('导入中断，请检查本机共享服务'))
-      }
-
-      request.send(formData)
-    }).catch((error: unknown) => {
+      socket.emit('room:select-media', {
+        roomId: currentRoom.roomId,
+        media: nextDescriptor,
+      })
+    } catch (error) {
       setUploadStatus('error')
-      setUploadLabel('片源导入失败')
-      setErrorMessage(error instanceof Error ? error.message : '导入失败')
-    })
+      setUploadLabel('本地片源校验失败')
+      setErrorMessage(error instanceof Error ? error.message : '片源校验失败')
+    }
   }
 
   const uploadSubtitle = async (file: File) => {
@@ -2018,12 +2055,25 @@ function App() {
                       <strong>{member.nickname}</strong>
                       <p>
                         {member.isHost ? '房主' : '正在观看'}
+                        {member.selectedMediaName
+                          ? ` · ${member.selectedMediaName}`
+                          : ''}
                         {room.isPreparing
                           ? ` · 已缓存 ${Math.max(0, Math.round(member.bufferAheadSeconds))}s`
                           : ''}
                       </p>
                     </div>
-                    <StatusPill tone={member.buffering ? 'warning' : 'success'}>
+                    <StatusPill
+                      tone={
+                        member.mediaMatchState === 'mismatch'
+                          ? 'warning'
+                          : member.mediaMatchState === 'missing'
+                            ? 'neutral'
+                            : member.buffering
+                              ? 'warning'
+                              : 'success'
+                      }
+                    >
                       {getMemberStatusLabel(room, member)}
                     </StatusPill>
                   </article>
@@ -2087,7 +2137,7 @@ function App() {
                         : 'success'
                   }
                 >
-                  {getPreparationLabel(room, localBuffering)}
+                  {getPreparationLabel(room, localBuffering, currentMember)}
                 </StatusPill>
                 <StatusPill tone={room?.subtitle ? 'accent' : 'neutral'}>
                   {room?.subtitle ? '字幕已同步' : '暂无字幕'}
@@ -2114,7 +2164,7 @@ function App() {
               </div>
             </div>
 
-            {isHost ? (
+            {room ? (
               <div className="upload-toolbar">
                 <div className="segment upload-segment">
                   <label
@@ -2147,41 +2197,43 @@ function App() {
                     />
                   </label>
 
-                  <label
-                    className={`segment__button segment__button--file ${
-                      subtitleStatus === 'done'
-                        ? 'segment__button--success'
-                        : subtitleStatus === 'error'
-                          ? 'segment__button--warning'
-                          : isSubtitleUploading
-                            ? 'segment__button--active'
-                            : ''
-                    }`}
-                  >
-                    <span className="segment__title">{subtitleButtonLabel}</span>
-                    <span className="segment__meta">{subtitleButtonMeta}</span>
-                    <input
-                      type="file"
-                      accept={SUBTITLE_ACCEPT}
-                      disabled={isMediaUploading || isSubtitleUploading}
-                      onChange={(event) => {
-                        const nextFile = event.target.files?.[0]
+                  {isHost ? (
+                    <label
+                      className={`segment__button segment__button--file ${
+                        subtitleStatus === 'done'
+                          ? 'segment__button--success'
+                          : subtitleStatus === 'error'
+                            ? 'segment__button--warning'
+                            : isSubtitleUploading
+                              ? 'segment__button--active'
+                              : ''
+                      }`}
+                    >
+                      <span className="segment__title">{subtitleButtonLabel}</span>
+                      <span className="segment__meta">{subtitleButtonMeta}</span>
+                      <input
+                        type="file"
+                        accept={SUBTITLE_ACCEPT}
+                        disabled={isMediaUploading || isSubtitleUploading}
+                        onChange={(event) => {
+                          const nextFile = event.target.files?.[0]
 
-                        if (!nextFile) {
-                          return
-                        }
+                          if (!nextFile) {
+                            return
+                          }
 
-                        void uploadSubtitle(nextFile)
-                        event.target.value = ''
-                      }}
-                    />
-                  </label>
+                          void uploadSubtitle(nextFile)
+                          event.target.value = ''
+                        }}
+                      />
+                    </label>
+                  ) : null}
                 </div>
 
                 <p className="support-note">{formatSupportHint(selectedFileName || room?.media?.name)}</p>
               </div>
             ) : (
-              <p className="support-note">{formatSupportHint(room?.media?.name)}</p>
+              <p className="support-note">{formatSupportHint(null)}</p>
             )}
 
             <div className="player-frame" ref={playerFrameRef}>
@@ -2275,8 +2327,14 @@ function App() {
                 ) : (
                   <div className="video video--placeholder">
                     <div>
-                      <p>还没有共享视频</p>
-                      <strong>房主选片后，大家会直接拉取同一份片源并保持时间轴一致。</strong>
+                      <p>{room?.media ? '等待本地匹配片源' : '还没有共享视频'}</p>
+                      <strong>
+                        {room?.media
+                          ? isHost
+                            ? '你已经发布了片源指纹，等待成员选择相同本地文件。'
+                            : '请选择与你朋友相同的本地文件，通过校验后就会直接本地播放。'
+                          : '房主选择本地片源后，大家会各自匹配同一份文件，只同步时间轴。'}
+                      </strong>
                     </div>
                   </div>
                 )}
@@ -2429,7 +2487,7 @@ function App() {
               </article>
             </div>
 
-            {isHost ? (
+            {room ? (
               <div className="progress-block">
                 <div className="progress__track">
                   <div

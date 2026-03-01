@@ -26,6 +26,11 @@ declare global {
           allUrls: string[]
         }>
       }
+      files: {
+        hashSha256: (filePath: string) => Promise<{
+          sha256: string
+        }>
+      }
       discovery: {
         advertise: (
           payload: DiscoveryAdvertisePayload | null,

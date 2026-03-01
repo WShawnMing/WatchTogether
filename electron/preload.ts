@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('desktopApp', {
     stop: () => ipcRenderer.invoke('relay:stop'),
     status: () => ipcRenderer.invoke('relay:status'),
   },
+  files: {
+    hashSha256: (filePath: string) =>
+      ipcRenderer.invoke('files:hash-sha256', filePath) as Promise<{ sha256: string }>,
+  },
   discovery: {
     advertise: (payload: DiscoveryAdvertisePayload | null) =>
       ipcRenderer.invoke('discovery:advertise', payload),

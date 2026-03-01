@@ -26,6 +26,7 @@ import {
   type DiscoveryProbeResponse,
   type JoinRoomPayload,
   type JoinRoomResult,
+  type LocalMediaSelectionPayload,
   type MediaSnapshot,
   type PlaybackControlPayload,
   type PlaybackEnvelope,
@@ -38,7 +39,7 @@ import {
 } from '../../shared/protocol.js'
 
 interface StoredMedia extends MediaSnapshot {
-  filePath: string
+  filePath: string | null
 }
 
 interface StoredSubtitle extends SubtitleSnapshot {
@@ -46,6 +47,9 @@ interface StoredSubtitle extends SubtitleSnapshot {
 }
 
 interface TrackedRoomMember extends RoomMemberSnapshot {
+  selectedMediaSha256: string | null
+  selectedMediaSize: number | null
+  selectedMediaDuration: number | null
   bufferingStartedAt: number | null
   lastBufferReportAt: number
 }
@@ -194,12 +198,45 @@ export async function startLocalRelay(
       .map((member) => member.socketId)
   }
 
+  function createTrackedMember(socketId: string, nickname: string, isHost: boolean): TrackedRoomMember {
+    return {
+      socketId,
+      nickname,
+      isHost,
+      mediaMatchState: 'missing',
+      selectedMediaName: null,
+      selectedMediaSha256: null,
+      selectedMediaSize: null,
+      selectedMediaDuration: null,
+      buffering: false,
+      startupReady: false,
+      bufferAheadSeconds: 0,
+      readyState: 0,
+      canPlayThrough: false,
+      connectedAt: Date.now(),
+      bufferingStartedAt: null,
+      lastBufferReportAt: 0,
+    }
+  }
+
+  function resetMemberPlaybackState(member: TrackedRoomMember) {
+    member.buffering = false
+    member.startupReady = false
+    member.bufferAheadSeconds = 0
+    member.readyState = 0
+    member.canPlayThrough = false
+    member.bufferingStartedAt = null
+    member.lastBufferReportAt = 0
+  }
+
   function toRoomSnapshot(room: RoomState): RoomSnapshot {
     const members = [...room.members.values()]
       .map((member) => ({
         socketId: member.socketId,
         nickname: member.nickname,
         isHost: member.socketId === room.hostSocketId,
+        mediaMatchState: member.mediaMatchState,
+        selectedMediaName: member.selectedMediaName,
         buffering: member.buffering,
         startupReady: member.startupReady,
         bufferAheadSeconds: member.bufferAheadSeconds,
@@ -223,7 +260,8 @@ export async function startLocalRelay(
             size: room.media.size,
             mimeType: room.media.mimeType,
             duration: room.media.duration,
-            uploadedAt: room.media.uploadedAt,
+            sha256: room.media.sha256,
+            selectedAt: room.media.selectedAt,
           }
         : null,
       subtitle: room.subtitle
@@ -321,6 +359,10 @@ export async function startLocalRelay(
       return true
     }
 
+    if (member.mediaMatchState !== 'matched') {
+      return false
+    }
+
     return isMemberReadyForBufferTarget(
       room,
       member,
@@ -330,6 +372,7 @@ export async function startLocalRelay(
 
   function isMemberReadyToResumePlayback(room: RoomState, member: TrackedRoomMember) {
     return (
+      member.mediaMatchState === 'matched' &&
       !member.buffering &&
       isMemberReadyForBufferTarget(
         room,
@@ -370,10 +413,12 @@ export async function startLocalRelay(
       return
     }
 
-    try {
-      rmSync(room.media.filePath, { force: true })
-    } catch {
-      // noop
+    if (room.media.filePath) {
+      try {
+        rmSync(room.media.filePath, { force: true })
+      } catch {
+        // noop
+      }
     }
 
     room.media = null
@@ -612,6 +657,56 @@ export async function startLocalRelay(
       '48000',
       outputPath,
     ])
+  }
+
+  function applyNewRoomMedia(
+    room: RoomState,
+    hostSocketId: string,
+    media: MediaSnapshot,
+  ) {
+    deleteMedia(room)
+    deleteSubtitle(room)
+
+    room.media = {
+      ...media,
+      filePath: null,
+    }
+
+    for (const member of room.members.values()) {
+      resetMemberPlaybackState(member)
+      member.mediaMatchState =
+        member.socketId === hostSocketId
+          ? 'matched'
+          : member.selectedMediaSha256 === media.sha256 &&
+              member.selectedMediaSize === media.size &&
+              Math.abs((member.selectedMediaDuration ?? 0) - (media.duration ?? 0)) <= 0.25
+            ? 'matched'
+            : 'missing'
+      member.selectedMediaName =
+        member.socketId === hostSocketId
+          ? media.name
+          : member.mediaMatchState === 'matched'
+            ? member.selectedMediaName
+            : null
+    }
+
+    room.playbackState = createInitialPlaybackState(hostSocketId)
+    room.startupGateActive = true
+    room.pendingStartRequested = false
+    room.startupBufferTargetSeconds = getStartupBufferTargetSeconds(media.duration)
+    room.playbackResumeBufferTargetSeconds = getPlaybackResumeBufferTargetSeconds(
+      media.duration,
+    )
+    room.resumeAfterBuffer = false
+    room.lastActiveAt = Date.now()
+  }
+
+  function matchesRoomMedia(roomMedia: MediaSnapshot, selectedMedia: MediaSnapshot) {
+    return (
+      roomMedia.sha256 === selectedMedia.sha256 &&
+      roomMedia.size === selectedMedia.size &&
+      Math.abs((roomMedia.duration ?? 0) - (selectedMedia.duration ?? 0)) <= 0.25
+    )
   }
 
   function deleteRoom(roomId: string) {
@@ -1024,18 +1119,19 @@ export async function startLocalRelay(
       size: finalSize,
       mimeType: finalMimeType,
       duration: finalDuration,
-      uploadedAt: Date.now(),
+      sha256: randomUUID(),
+      selectedAt: Date.now(),
       filePath: finalPath,
     }
 
     for (const member of room.members.values()) {
-      member.buffering = false
-      member.startupReady = false
-      member.bufferAheadSeconds = 0
-      member.readyState = 0
-      member.canPlayThrough = false
-      member.bufferingStartedAt = null
-      member.lastBufferReportAt = 0
+      resetMemberPlaybackState(member)
+      member.mediaMatchState = member.socketId === socketId ? 'matched' : 'missing'
+      member.selectedMediaName = member.socketId === socketId ? finalName : null
+      member.selectedMediaSha256 = member.socketId === socketId ? room.media.sha256 : null
+      member.selectedMediaSize = member.socketId === socketId ? room.media.size : null
+      member.selectedMediaDuration =
+        member.socketId === socketId ? room.media.duration : null
     }
 
     room.playbackState = createInitialPlaybackState(socketId)
@@ -1060,7 +1156,8 @@ export async function startLocalRelay(
         size: room.media.size,
         mimeType: room.media.mimeType,
         duration: room.media.duration,
-        uploadedAt: room.media.uploadedAt,
+        sha256: room.media.sha256,
+        selectedAt: room.media.selectedAt,
       },
       optimizedForNetwork,
       sourceBitrateMbps: sourceBitrate ? sourceBitrate / 1_000_000 : null,
@@ -1136,7 +1233,7 @@ export async function startLocalRelay(
   app.get('/api/rooms/:roomId/media/:mediaId', (request, response) => {
     const room = resolveRoomFromRequest(request)
 
-    if (!room?.media || room.media.id !== request.params.mediaId) {
+    if (!room?.media || room.media.id !== request.params.mediaId || !room.media.filePath) {
       response.status(404).json({ error: '视频不存在' })
       return
     }
@@ -1241,19 +1338,13 @@ export async function startLocalRelay(
           return
         }
 
-        room.members.set(socket.id, {
-          socketId: socket.id,
+        const member = createTrackedMember(
+          socket.id,
           nickname,
-          isHost: socket.id === room.hostSocketId,
-          buffering: false,
-          startupReady: !room.media || !room.startupGateActive,
-          bufferAheadSeconds: 0,
-          readyState: 0,
-          canPlayThrough: false,
-          connectedAt: Date.now(),
-          bufferingStartedAt: null,
-          lastBufferReportAt: 0,
-        })
+          socket.id === room.hostSocketId,
+        )
+        member.startupReady = !room.media || !room.startupGateActive
+        room.members.set(socket.id, member)
 
         if (room.media && !memberAlreadyJoined && memberCountBeforeJoin > 0) {
           room.startupGateActive = true
@@ -1292,6 +1383,55 @@ export async function startLocalRelay(
         }
       },
     )
+
+    socket.on('room:select-media', (payload: LocalMediaSelectionPayload) => {
+      const roomId = normalizeRoomId(payload.roomId)
+      const room = rooms.get(roomId)
+      const member = room?.members.get(socket.id)
+
+      if (!room || !member) {
+        return
+      }
+
+      const selectedMedia: MediaSnapshot = {
+        ...payload.media,
+        selectedAt: Date.now(),
+      }
+
+      member.selectedMediaName = selectedMedia.name
+      member.selectedMediaSha256 = selectedMedia.sha256
+      member.selectedMediaSize = selectedMedia.size
+      member.selectedMediaDuration = selectedMedia.duration
+      resetMemberPlaybackState(member)
+
+      if (socket.id === room.hostSocketId) {
+        applyNewRoomMedia(room, socket.id, selectedMedia)
+        emitRoomSnapshot(io, room)
+        emitPlaybackState(io, room)
+        return
+      }
+
+      if (!room.media) {
+        member.mediaMatchState = 'missing'
+        room.lastActiveAt = Date.now()
+        emitRoomSnapshot(io, room)
+        io.to(socket.id).emit('room:error', '等待房主先选择本地片源')
+        return
+      }
+
+      member.mediaMatchState = matchesRoomMedia(room.media, selectedMedia)
+        ? 'matched'
+        : 'mismatch'
+      room.lastActiveAt = Date.now()
+      syncMemberStartupReadiness(room)
+      emitRoomSnapshot(io, room)
+      syncStartupGate(io, room)
+      applyBuffering(io, room)
+
+      if (member.mediaMatchState === 'mismatch') {
+        io.to(socket.id).emit('room:error', '本地文件与房主片源不一致，请重新选择')
+      }
+    })
 
     socket.on('playback:control', (payload: PlaybackControlPayload) => {
       const roomId = normalizeRoomId(payload.roomId)

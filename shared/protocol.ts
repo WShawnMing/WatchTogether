@@ -2,6 +2,7 @@ export type SyncMode = 'soft' | 'strict'
 export type PlaybackReason = 'user' | 'buffer_lock' | 'media_transfer' | 'startup_gate'
 export type PeerRole = 'host' | 'guest'
 export type DiscoveryPlaybackState = 'idle' | 'paused' | 'playing'
+export type MediaMatchState = 'missing' | 'hashing' | 'matched' | 'mismatch'
 export const MAX_ROOM_MEMBERS = 6
 export const DEFAULT_RELAY_PORT = 53311
 
@@ -20,6 +21,7 @@ export interface MediaDescriptor {
   size: number
   mimeType: string
   duration: number | null
+  sha256: string
 }
 
 export interface SubtitleDescriptor {
@@ -33,6 +35,8 @@ export interface RoomMemberSnapshot {
   socketId: string
   nickname: string
   isHost: boolean
+  mediaMatchState: MediaMatchState
+  selectedMediaName: string | null
   buffering: boolean
   startupReady: boolean
   bufferAheadSeconds: number
@@ -42,7 +46,7 @@ export interface RoomMemberSnapshot {
 }
 
 export interface MediaSnapshot extends MediaDescriptor {
-  uploadedAt: number
+  selectedAt: number
 }
 
 export interface SubtitleSnapshot extends SubtitleDescriptor {
@@ -91,6 +95,11 @@ export interface PlaybackControlPayload {
   paused: boolean
   playbackRate: number
   reason: PlaybackReason
+}
+
+export interface LocalMediaSelectionPayload {
+  roomId: string
+  media: MediaDescriptor
 }
 
 export interface BufferingPayload {

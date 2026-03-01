@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createSocket, type RemoteInfo, type Socket as DiscoverySocket } from 'node:dgram'
 import { app, BrowserWindow, ipcMain, nativeImage } from 'electron'
+import { createReadStream } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -51,6 +52,23 @@ const discoveredSessions = new Map<string, DiscoverySession>()
 type LocalRelayHandle = {
   close: () => Promise<void>
   port: number
+}
+
+function hashFileSha256(filePath: string) {
+  return new Promise<string>((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(filePath)
+
+    stream.on('data', (chunk) => {
+      hash.update(chunk)
+    })
+    stream.on('error', (error) => {
+      reject(error)
+    })
+    stream.on('end', () => {
+      resolve(hash.digest('hex'))
+    })
+  })
 }
 
 function getRuntimeIconPath() {
@@ -632,6 +650,12 @@ ipcMain.handle('relay:status', async () => {
     localUrl: `http://127.0.0.1:${relayHandle.port}`,
     shareUrls: urls.filter((url) => !url.includes('127.0.0.1')),
     allUrls: urls,
+  }
+})
+
+ipcMain.handle('files:hash-sha256', async (_event, filePath: string) => {
+  return {
+    sha256: await hashFileSha256(filePath),
   }
 })
 
