@@ -1,5 +1,5 @@
 export type SyncMode = 'soft' | 'strict'
-export type PlaybackReason = 'user' | 'buffer_lock' | 'media_transfer'
+export type PlaybackReason = 'user' | 'buffer_lock' | 'media_transfer' | 'startup_gate'
 export type PeerRole = 'host' | 'guest'
 export type DiscoveryPlaybackState = 'idle' | 'paused' | 'playing'
 export const MAX_ROOM_MEMBERS = 6
@@ -34,6 +34,10 @@ export interface RoomMemberSnapshot {
   nickname: string
   isHost: boolean
   buffering: boolean
+  startupReady: boolean
+  bufferAheadSeconds: number
+  readyState: number
+  canPlayThrough: boolean
   connectedAt: number
 }
 
@@ -49,6 +53,8 @@ export interface RoomSnapshot {
   roomId: string
   roomName: string
   requiresPassword: boolean
+  isPreparing: boolean
+  startupBufferTargetSeconds: number
   members: RoomMemberSnapshot[]
   media: MediaSnapshot | null
   subtitle: SubtitleSnapshot | null
@@ -90,6 +96,10 @@ export interface PlaybackControlPayload {
 export interface BufferingPayload {
   roomId: string
   buffering: boolean
+  startupReady?: boolean
+  bufferAheadSeconds?: number
+  readyState?: number
+  canPlayThrough?: boolean
 }
 
 export interface RoomConfigPayload {

@@ -44,16 +44,25 @@ interface StoredSubtitle extends SubtitleSnapshot {
   filePath: string
 }
 
+interface TrackedRoomMember extends RoomMemberSnapshot {
+  bufferingStartedAt: number | null
+  lastBufferReportAt: number
+}
+
 interface RoomState {
   id: string
   roomName: string
   password: string | null
   hostSocketId: string
-  members: Map<string, RoomMemberSnapshot>
+  members: Map<string, TrackedRoomMember>
   media: StoredMedia | null
   subtitle: StoredSubtitle | null
   playbackState: PlaybackState
   syncMode: SyncMode
+  startupGateActive: boolean
+  pendingStartRequested: boolean
+  startupBufferTargetSeconds: number
+  playbackResumeBufferTargetSeconds: number
   resumeAfterBuffer: boolean
   lastActiveAt: number
 }
@@ -76,6 +85,7 @@ export async function startLocalRelay(
   const rooms = new Map<string, RoomState>()
   const socketToRoom = new Map<string, string>()
   const roomIdleTtlMs = (options.roomIdleTtlMinutes ?? 120) * 60 * 1000
+  const roomSnapshotHeartbeatMs = 4_000
   const uploadRoot = path.resolve(
     options.storageRoot ?? process.env.WATCH_TOGETHER_STORAGE_DIR ?? '.watchtogether/uploads',
   )
@@ -102,6 +112,10 @@ export async function startLocalRelay(
       subtitle: null,
       playbackState: createInitialPlaybackState(hostSocketId),
       syncMode: 'soft',
+      startupGateActive: false,
+      pendingStartRequested: false,
+      startupBufferTargetSeconds: 12,
+      playbackResumeBufferTargetSeconds: 6,
       resumeAfterBuffer: false,
       lastActiveAt: now,
     }
@@ -172,8 +186,15 @@ export async function startLocalRelay(
   function toRoomSnapshot(room: RoomState): RoomSnapshot {
     const members = [...room.members.values()]
       .map((member) => ({
-        ...member,
+        socketId: member.socketId,
+        nickname: member.nickname,
         isHost: member.socketId === room.hostSocketId,
+        buffering: member.buffering,
+        startupReady: member.startupReady,
+        bufferAheadSeconds: member.bufferAheadSeconds,
+        readyState: member.readyState,
+        canPlayThrough: member.canPlayThrough,
+        connectedAt: member.connectedAt,
       }))
       .sort((left, right) => Number(right.isHost) - Number(left.isHost))
 
@@ -181,6 +202,8 @@ export async function startLocalRelay(
       roomId: room.id,
       roomName: room.roomName,
       requiresPassword: Boolean(room.password),
+      isPreparing: room.startupGateActive,
+      startupBufferTargetSeconds: room.startupBufferTargetSeconds,
       members,
       media: room.media
         ? {
@@ -224,6 +247,111 @@ export async function startLocalRelay(
     }
 
     return Math.max(0.5, Math.min(2, value))
+  }
+
+  function getStartupBufferTargetSeconds(duration: number | null) {
+    if (!Number.isFinite(duration) || !duration || duration <= 0) {
+      return 12
+    }
+
+    return Math.min(24, Math.max(8, duration * 0.02))
+  }
+
+  function getPlaybackResumeBufferTargetSeconds(duration: number | null) {
+    if (!Number.isFinite(duration) || !duration || duration <= 0) {
+      return 6
+    }
+
+    return Math.min(10, Math.max(3, duration * 0.01))
+  }
+
+  function getCurrentPlaybackPosition(room: RoomState) {
+    return Math.max(0, deriveCurrentPosition(room.playbackState))
+  }
+
+  function getEffectiveBufferTarget(room: RoomState, baseTargetSeconds: number) {
+    if (!room.media?.duration || !Number.isFinite(room.media.duration)) {
+      return baseTargetSeconds
+    }
+
+    const remainingDuration = Math.max(
+      0,
+      room.media.duration - getCurrentPlaybackPosition(room),
+    )
+
+    if (remainingDuration <= 0) {
+      return 0
+    }
+
+    return Math.max(0.8, Math.min(baseTargetSeconds, remainingDuration))
+  }
+
+  function isMemberReadyForBufferTarget(
+    room: RoomState,
+    member: TrackedRoomMember,
+    baseTargetSeconds: number,
+  ) {
+    if (!room.media) {
+      return true
+    }
+
+    if (member.canPlayThrough || member.readyState >= 4) {
+      return true
+    }
+
+    return (
+      member.readyState >= 3 &&
+      member.bufferAheadSeconds >= getEffectiveBufferTarget(room, baseTargetSeconds)
+    )
+  }
+
+  function isMemberStartupReady(room: RoomState, member: TrackedRoomMember) {
+    if (!room.media || !room.startupGateActive) {
+      return true
+    }
+
+    return isMemberReadyForBufferTarget(
+      room,
+      member,
+      room.startupBufferTargetSeconds,
+    )
+  }
+
+  function isMemberReadyToResumePlayback(room: RoomState, member: TrackedRoomMember) {
+    return (
+      !member.buffering &&
+      isMemberReadyForBufferTarget(
+        room,
+        member,
+        room.playbackResumeBufferTargetSeconds,
+      )
+    )
+  }
+
+  function syncMemberStartupReadiness(room: RoomState) {
+    for (const member of room.members.values()) {
+      member.startupReady = isMemberStartupReady(room, member)
+    }
+  }
+
+  function areAllMembersStartupReady(room: RoomState) {
+    if (!room.media || room.members.size === 0) {
+      return false
+    }
+
+    syncMemberStartupReadiness(room)
+
+    return [...room.members.values()].every((member) => member.startupReady)
+  }
+
+  function areAllMembersReadyToResumePlayback(room: RoomState) {
+    if (!room.media || room.members.size === 0) {
+      return false
+    }
+
+    return [...room.members.values()].every((member) =>
+      isMemberReadyToResumePlayback(room, member),
+    )
   }
 
   function deleteMedia(room: RoomState) {
@@ -410,19 +538,64 @@ export async function startLocalRelay(
       return
     }
 
+    syncMemberStartupReadiness(room)
     emitRoomSnapshot(io, room)
+    syncStartupGate(io, room)
     applyBuffering(io, room)
   }
 
-  function applyBuffering(io: Server, room: RoomState) {
-    if (room.syncMode !== 'strict') {
-      room.resumeAfterBuffer = false
-      return
+  function getSoftBufferGraceMs(room: RoomState) {
+    if (!room.media?.duration || !Number.isFinite(room.media.duration)) {
+      return 900
     }
 
+    const remainingDuration = Math.max(
+      0,
+      room.media.duration - getCurrentPlaybackPosition(room),
+    )
+
+    if (remainingDuration <= 5) {
+      return 0
+    }
+
+    if (remainingDuration <= 15) {
+      return 350
+    }
+
+    return 900
+  }
+
+  function shouldPauseForBuffering(room: RoomState) {
+    const bufferingMembers = [...room.members.values()].filter((member) => member.buffering)
+
+    if (bufferingMembers.length === 0) {
+      return false
+    }
+
+    if (room.syncMode === 'strict') {
+      return true
+    }
+
+    const now = Date.now()
+    const graceMs = getSoftBufferGraceMs(room)
+
+    return bufferingMembers.some((member) => {
+      if (member.readyState < 3) {
+        return true
+      }
+
+      if (member.bufferingStartedAt === null) {
+        return false
+      }
+
+      return now - member.bufferingStartedAt >= graceMs
+    })
+  }
+
+  function applyBuffering(io: Server, room: RoomState) {
     const bufferingUsers = getBufferingUsers(room)
 
-    if (bufferingUsers.length > 0 && !room.playbackState.paused) {
+    if (shouldPauseForBuffering(room) && !room.playbackState.paused) {
       markPlayback(
         room,
         {
@@ -438,7 +611,11 @@ export async function startLocalRelay(
       return
     }
 
-    if (bufferingUsers.length === 0 && room.resumeAfterBuffer) {
+    if (
+      room.resumeAfterBuffer &&
+      bufferingUsers.length === 0 &&
+      areAllMembersReadyToResumePlayback(room)
+    ) {
       markPlayback(
         room,
         {
@@ -452,6 +629,37 @@ export async function startLocalRelay(
       room.resumeAfterBuffer = false
       emitPlaybackState(io, room)
     }
+  }
+
+  function syncStartupGate(io: Server, room: RoomState) {
+    if (!room.startupGateActive) {
+      return
+    }
+
+    if (!areAllMembersStartupReady(room)) {
+      emitRoomSnapshot(io, room)
+      return
+    }
+
+    emitRoomSnapshot(io, room)
+
+    if (!room.pendingStartRequested || !room.playbackState.paused) {
+      return
+    }
+
+    room.startupGateActive = false
+    room.pendingStartRequested = false
+    markPlayback(
+      room,
+      {
+        position: room.playbackState.position,
+        paused: false,
+        playbackRate: room.playbackState.playbackRate,
+        updatedBy: room.hostSocketId,
+      },
+      'startup_gate',
+    )
+    emitPlaybackState(io, room)
   }
 
   function resolveRoomFromRequest(request: Request) {
@@ -513,6 +721,12 @@ export async function startLocalRelay(
     cors: {
       origin: true,
       credentials: true,
+    },
+    pingInterval: 15_000,
+    pingTimeout: 30_000,
+    connectionStateRecovery: {
+      maxDisconnectionDuration: 30_000,
+      skipMiddlewares: true,
     },
   })
 
@@ -605,9 +819,23 @@ export async function startLocalRelay(
 
     for (const member of room.members.values()) {
       member.buffering = false
+      member.startupReady = false
+      member.bufferAheadSeconds = 0
+      member.readyState = 0
+      member.canPlayThrough = false
+      member.bufferingStartedAt = null
+      member.lastBufferReportAt = 0
     }
 
     room.playbackState = createInitialPlaybackState(socketId)
+    room.startupGateActive = true
+    room.pendingStartRequested = false
+    room.startupBufferTargetSeconds = getStartupBufferTargetSeconds(
+      room.media.duration,
+    )
+    room.playbackResumeBufferTargetSeconds = getPlaybackResumeBufferTargetSeconds(
+      room.media.duration,
+    )
     room.resumeAfterBuffer = false
     room.lastActiveAt = Date.now()
 
@@ -787,8 +1015,12 @@ export async function startLocalRelay(
           sanitizeRoomName(payload.roomName ?? '', nickname),
           requestedPassword,
         )
+        const memberAlreadyJoined = room.members.has(socket.id)
+        const memberCountBeforeJoin = room.members.size
+        const wasPlaying = room.media ? !room.playbackState.paused : false
+        let pausedForJoinGate = false
 
-        if (!room.members.has(socket.id) && room.members.size >= MAX_ROOM_MEMBERS) {
+        if (!memberAlreadyJoined && room.members.size >= MAX_ROOM_MEMBERS) {
           callback?.({
             ok: false,
             error: '房间人数已满',
@@ -801,8 +1033,34 @@ export async function startLocalRelay(
           nickname,
           isHost: socket.id === room.hostSocketId,
           buffering: false,
+          startupReady: !room.media || !room.startupGateActive,
+          bufferAheadSeconds: 0,
+          readyState: 0,
+          canPlayThrough: false,
           connectedAt: Date.now(),
+          bufferingStartedAt: null,
+          lastBufferReportAt: 0,
         })
+
+        if (room.media && !memberAlreadyJoined && memberCountBeforeJoin > 0) {
+          room.startupGateActive = true
+          room.pendingStartRequested = wasPlaying
+          syncMemberStartupReadiness(room)
+
+          if (wasPlaying) {
+            pausedForJoinGate = true
+            markPlayback(
+              room,
+              {
+                position: getCurrentPlaybackPosition(room),
+                paused: true,
+                playbackRate: room.playbackState.playbackRate,
+                updatedBy: room.hostSocketId,
+              },
+              'startup_gate',
+            )
+          }
+        }
 
         socket.join(roomId)
         socketToRoom.set(socket.id, roomId)
@@ -814,7 +1072,11 @@ export async function startLocalRelay(
         })
 
         emitRoomSnapshot(io, room)
-        emitPlaybackState(io, room, socket.id)
+        if (pausedForJoinGate) {
+          emitPlaybackState(io, room)
+        } else {
+          emitPlaybackState(io, room, socket.id)
+        }
       },
     )
 
@@ -824,6 +1086,29 @@ export async function startLocalRelay(
 
       if (!room || !room.members.has(socket.id) || !room.media) {
         return
+      }
+
+      if (!payload.paused && room.startupGateActive) {
+        if (!areAllMembersStartupReady(room)) {
+          room.pendingStartRequested = true
+          markPlayback(
+            room,
+            {
+              position: payload.position,
+              paused: true,
+              playbackRate: payload.playbackRate,
+              updatedBy: socket.id,
+            },
+            'startup_gate',
+          )
+          emitRoomSnapshot(io, room)
+          emitPlaybackState(io, room)
+          return
+        }
+
+        room.startupGateActive = false
+        room.pendingStartRequested = false
+        emitRoomSnapshot(io, room)
       }
 
       if (room.syncMode === 'strict' && getBufferingUsers(room).length > 0 && !payload.paused) {
@@ -852,9 +1137,21 @@ export async function startLocalRelay(
         return
       }
 
-      member.buffering = payload.buffering
-      room.lastActiveAt = Date.now()
+      const nextBuffering = Boolean(payload.buffering)
+      const now = Date.now()
+
+      member.buffering = nextBuffering
+      member.bufferAheadSeconds = Math.max(0, payload.bufferAheadSeconds ?? 0)
+      member.readyState = Math.max(0, payload.readyState ?? 0)
+      member.canPlayThrough = Boolean(payload.canPlayThrough)
+      member.lastBufferReportAt = now
+      member.bufferingStartedAt = nextBuffering
+        ? member.bufferingStartedAt ?? now
+        : null
+      room.lastActiveAt = now
+      syncMemberStartupReadiness(room)
       emitRoomSnapshot(io, room)
+      syncStartupGate(io, room)
       applyBuffering(io, room)
     })
 
@@ -866,6 +1163,16 @@ export async function startLocalRelay(
       }
 
       emitPlaybackState(io, room, socket.id)
+    })
+
+    socket.on('room:request-snapshot', ({ roomId }: { roomId: string }) => {
+      const room = rooms.get(normalizeRoomId(roomId))
+
+      if (!room || !room.members.has(socket.id)) {
+        return
+      }
+
+      io.to(socket.id).emit('room:snapshot', toRoomSnapshot(room))
     })
 
     socket.on('room:config', (payload: RoomConfigPayload) => {
@@ -919,6 +1226,16 @@ export async function startLocalRelay(
       emitPlaybackState(io, room)
     }
   }, 1500)
+
+  const snapshotTimer = setInterval(() => {
+    for (const room of rooms.values()) {
+      if (room.members.size === 0) {
+        continue
+      }
+
+      emitRoomSnapshot(io, room)
+    }
+  }, roomSnapshotHeartbeatMs)
 
   const cleanupTimer = setInterval(() => {
     const now = Date.now()
@@ -989,6 +1306,7 @@ export async function startLocalRelay(
 
       closePromise = (async () => {
         clearInterval(playbackTimer)
+        clearInterval(snapshotTimer)
         clearInterval(cleanupTimer)
 
         for (const roomId of [...rooms.keys()]) {

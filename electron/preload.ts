@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('desktopApp', {
   discovery: {
     advertise: (payload: DiscoveryAdvertisePayload | null) =>
       ipcRenderer.invoke('discovery:advertise', payload),
-    list: () => ipcRenderer.invoke('discovery:list') as Promise<DiscoverySession[]>,
+    list: (options?: { force?: boolean }) =>
+      ipcRenderer.invoke('discovery:list', options) as Promise<DiscoverySession[]>,
   },
 })

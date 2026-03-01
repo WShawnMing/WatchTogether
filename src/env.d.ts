@@ -30,7 +30,7 @@ declare global {
         advertise: (
           payload: DiscoveryAdvertisePayload | null,
         ) => Promise<{ ok: true }>
-        list: () => Promise<DiscoverySession[]>
+        list: (options?: { force?: boolean }) => Promise<DiscoverySession[]>
       }
     }
   }

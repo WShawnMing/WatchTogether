@@ -244,6 +244,57 @@ function formatSupportHint(mediaName?: string | null) {
   return '当前格式通常可直接播放。'
 }
 
+function getBufferedAheadSeconds(video: HTMLVideoElement) {
+  const currentTime = video.currentTime
+
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const start = video.buffered.start(index)
+    const end = video.buffered.end(index)
+
+    if (currentTime >= start && currentTime <= end) {
+      return Math.max(0, end - currentTime)
+    }
+
+    if (currentTime < start) {
+      return Math.max(0, end - start)
+    }
+  }
+
+  return 0
+}
+
+function getPreparationLabel(room: RoomSnapshot | null, localBuffering: boolean) {
+  if (!room?.media) {
+    return '等待片源'
+  }
+
+  if (localBuffering) {
+    return '本地缓冲中'
+  }
+
+  if (room.isPreparing) {
+    if (room.members.every((member) => member.startupReady)) {
+      return '已准备，等待开播'
+    }
+
+    return '准备中'
+  }
+
+  return '片源已就绪'
+}
+
+function getMemberStatusLabel(room: RoomSnapshot | null, member: RoomSnapshot['members'][number]) {
+  if (member.buffering) {
+    return '缓冲中'
+  }
+
+  if (room?.isPreparing && !member.startupReady) {
+    return `准备 ${Math.max(0, Math.round(member.bufferAheadSeconds))}s`
+  }
+
+  return '已就绪'
+}
+
 function StatusPill({
   tone,
   children,
@@ -262,6 +313,7 @@ function App() {
   const [socketId, setSocketId] = useState('')
   const [relayStatus, setRelayStatus] = useState<RelayStatus>(EMPTY_RELAY_STATUS)
   const [discoveredSessions, setDiscoveredSessions] = useState<DiscoverySession[]>([])
+  const [discoveryRefreshing, setDiscoveryRefreshing] = useState(false)
   const [connectionState, setConnectionState] =
     useState<ConnectionState>('idle')
   const [room, setRoom] = useState<RoomSnapshot | null>(null)
@@ -299,6 +351,10 @@ function App() {
   const localBufferingRef = useRef(false)
   const localUserActionUntilRef = useRef(0)
   const manualDisconnectRef = useRef(false)
+  const lastRoomSnapshotAtRef = useRef(0)
+  const lastPlaybackStateAtRef = useRef(0)
+  const canPlayThroughRef = useRef(false)
+  const lastPublishedBufferStateRef = useRef('')
   const toastTimersRef = useRef<Map<string, number>>(new Map())
   const memberPresencePrimedRef = useRef(false)
 
@@ -406,6 +462,48 @@ function App() {
     })
   }, [serverUrl])
 
+  const refreshDiscoveredSessions = useCallback(
+    async (showBusy = false, force = false) => {
+      if (!window.desktopApp?.discovery) {
+        return
+      }
+
+      if (showBusy) {
+        setDiscoveryRefreshing(true)
+      }
+
+      try {
+        const sessions = await window.desktopApp.discovery.list({ force })
+
+        startTransition(() => {
+          setDiscoveredSessions(sessions)
+        })
+
+        if (force) {
+          window.setTimeout(() => {
+            void window.desktopApp?.discovery
+              ?.list()
+              .then((nextSessions) => {
+                startTransition(() => {
+                  setDiscoveredSessions(nextSessions)
+                })
+              })
+              .catch(() => {
+                // Keep discovery best-effort.
+              })
+          }, 900)
+        }
+      } catch {
+        setDiscoveredSessions([])
+      } finally {
+        if (showBusy) {
+          setDiscoveryRefreshing(false)
+        }
+      }
+    },
+    [],
+  )
+
   useEffect(() => {
     if (!window.desktopApp?.discovery) {
       return
@@ -414,32 +512,22 @@ function App() {
     let disposed = false
 
     const refresh = async () => {
-      try {
-        const sessions = await window.desktopApp?.discovery.list()
-
-        if (!disposed && sessions) {
-          startTransition(() => {
-            setDiscoveredSessions(sessions)
-          })
-        }
-      } catch {
-        if (!disposed) {
-          setDiscoveredSessions([])
-        }
-      }
+      await refreshDiscoveredSessions()
     }
 
     void refresh()
 
     const interval = window.setInterval(() => {
-      void refresh()
+      if (!disposed) {
+        void refresh()
+      }
     }, 2_000)
 
     return () => {
       disposed = true
       window.clearInterval(interval)
     }
-  }, [])
+  }, [refreshDiscoveredSessions])
 
   useEffect(() => {
     if (!window.desktopApp?.discovery || !relayStatus.running || !relayStatus.port || !room || !isHost) {
@@ -813,6 +901,7 @@ function App() {
   }, [])
 
   const handleSnapshot = (snapshot: RoomSnapshot) => {
+    lastRoomSnapshotAtRef.current = Date.now()
     const previousRoom = roomRef.current
     const previousMediaId = roomRef.current?.media?.id ?? null
     const nextMediaId = snapshot.media?.id ?? null
@@ -823,6 +912,8 @@ function App() {
       localBufferingRef.current = false
       pendingPlaybackRef.current = null
       localUserActionUntilRef.current = 0
+      canPlayThroughRef.current = false
+      lastPublishedBufferStateRef.current = ''
     }
 
     if (
@@ -905,6 +996,7 @@ function App() {
   }
 
   const handlePlayback = (incoming: PlaybackEnvelope) => {
+    lastPlaybackStateAtRef.current = Date.now()
     startTransition(() => {
       setPlayback(incoming)
     })
@@ -932,21 +1024,42 @@ function App() {
     })
   }
 
-  const publishBufferState = (buffering: boolean) => {
+  const publishBufferState = (buffering: boolean, force = false) => {
     const socket = socketRef.current
     const currentRoom = roomRef.current
+    const video = videoRef.current
 
-    if (!socket || !currentRoom) {
+    if (!socket || !currentRoom || !video) {
       return
     }
+
+    const bufferAheadSeconds = Number(getBufferedAheadSeconds(video).toFixed(1))
+    const readyState = video.readyState
+    const canPlayThrough =
+      canPlayThroughRef.current || readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA
 
     localBufferingRef.current = buffering
     setLocalBuffering(buffering)
 
-    socket.emit('client:buffering', {
+    const payload = {
       roomId: currentRoom.roomId,
       buffering,
-    })
+      startupReady:
+        canPlayThrough ||
+        (readyState >= HTMLMediaElement.HAVE_FUTURE_DATA &&
+          bufferAheadSeconds >= (currentRoom.startupBufferTargetSeconds || 12)),
+      bufferAheadSeconds,
+      readyState,
+      canPlayThrough,
+    }
+    const signature = JSON.stringify(payload)
+
+    if (!force && signature === lastPublishedBufferStateRef.current) {
+      return
+    }
+
+    lastPublishedBufferStateRef.current = signature
+    socket.emit('client:buffering', payload)
   }
 
   const requestFreshPlaybackState = () => {
@@ -961,6 +1074,87 @@ function App() {
       roomId: currentRoom.roomId,
     })
   }
+
+  const requestFreshRoomSnapshot = () => {
+    const socket = socketRef.current
+    const currentRoom = roomRef.current
+
+    if (!socket || !currentRoom) {
+      return
+    }
+
+    socket.emit('room:request-snapshot', {
+      roomId: currentRoom.roomId,
+    })
+  }
+
+  useEffect(() => {
+    if (!room?.media || !socketId) {
+      return
+    }
+
+    const publishStatus = () => {
+      const video = videoRef.current
+
+      if (!video) {
+        return
+      }
+
+      const buffering =
+        localBufferingRef.current ||
+        (!video.paused && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)
+
+      publishBufferState(buffering)
+    }
+
+    publishStatus()
+
+    const interval = window.setInterval(publishStatus, 1_000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [room?.media, room?.media?.id, room?.startupBufferTargetSeconds, socketId])
+
+  useEffect(() => {
+    if (connectionState !== 'connected' || !room) {
+      return
+    }
+
+    const heartbeatIntervalMs = 4_000
+    const staleThresholdMs = 12_000
+
+    const tick = () => {
+      const socket = socketRef.current
+
+      if (!socket?.connected || !roomRef.current) {
+        return
+      }
+
+      requestFreshRoomSnapshot()
+      requestFreshPlaybackState()
+
+      const latestActivityAt = Math.max(
+        lastRoomSnapshotAtRef.current,
+        lastPlaybackStateAtRef.current,
+      )
+
+      if (
+        latestActivityAt > 0 &&
+        Date.now() - latestActivityAt > staleThresholdMs
+      ) {
+        setErrorMessage('房间状态校验超时，正在尝试重新同步...')
+      }
+    }
+
+    tick()
+
+    const interval = window.setInterval(tick, heartbeatIntervalMs)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [connectionState, room])
 
   const ensureLocalRelay = async () => {
     if (!window.desktopApp?.relay) {
@@ -1012,7 +1206,9 @@ function App() {
       transports: ['websocket', 'polling'],
       autoConnect: false,
       reconnection: true,
+      reconnectionDelay: 1_200,
       reconnectionDelayMax: 4_000,
+      timeout: 12_000,
     })
 
     joinPayloadRef.current = {
@@ -1049,6 +1245,14 @@ function App() {
         const payload = joinPayloadRef.current
 
         setSocketId(nextSocket.id ?? '')
+
+        if (nextSocket.recovered && roomRef.current) {
+          setConnectionState('connected')
+          requestFreshRoomSnapshot()
+          requestFreshPlaybackState()
+          resolveOnce()
+          return
+        }
 
         if (!payload) {
           rejectOnce(new Error('加入参数丢失'))
@@ -1122,6 +1326,10 @@ function App() {
     pendingPlaybackRef.current = null
     localBufferingRef.current = false
     localUserActionUntilRef.current = 0
+    lastRoomSnapshotAtRef.current = 0
+    lastPlaybackStateAtRef.current = 0
+    canPlayThroughRef.current = false
+    lastPublishedBufferStateRef.current = ''
     memberPresencePrimedRef.current = false
     roomRef.current = null
     setSocketId('')
@@ -1468,7 +1676,17 @@ function App() {
                 <p className="panel__eyebrow">Nearby</p>
                 <h2>附近正在共享</h2>
               </div>
-              <StatusPill tone="neutral">{`${discoveredSessions.length} 个房间`}</StatusPill>
+              <div className="panel__header-actions">
+                <StatusPill tone="neutral">{`${discoveredSessions.length} 个房间`}</StatusPill>
+                <button
+                  className="button button--secondary button--compact"
+                  onClick={() => void refreshDiscoveredSessions(true, true)}
+                  disabled={discoveryRefreshing}
+                  type="button"
+                >
+                  {discoveryRefreshing ? '刷新中...' : '刷新'}
+                </button>
+              </div>
             </div>
 
             <div className="session-list">
@@ -1583,10 +1801,15 @@ function App() {
                   <article className="member-card" key={member.socketId}>
                     <div>
                       <strong>{member.nickname}</strong>
-                      <p>{member.isHost ? '房主' : '正在观看'}</p>
+                      <p>
+                        {member.isHost ? '房主' : '正在观看'}
+                        {room.isPreparing
+                          ? ` · 已缓存 ${Math.max(0, Math.round(member.bufferAheadSeconds))}s`
+                          : ''}
+                      </p>
                     </div>
                     <StatusPill tone={member.buffering ? 'warning' : 'success'}>
-                      {member.buffering ? '缓冲中' : '已就绪'}
+                      {getMemberStatusLabel(room, member)}
                     </StatusPill>
                   </article>
                 ))}
@@ -1640,14 +1863,24 @@ function App() {
               </div>
 
               <div className="panel__chips">
-                <StatusPill tone={room?.media ? 'success' : 'neutral'}>
-                  {room?.media ? '片源已就绪' : '等待片源'}
+                <StatusPill
+                  tone={
+                    !room?.media
+                      ? 'neutral'
+                      : room.isPreparing || localBuffering
+                        ? 'warning'
+                        : 'success'
+                  }
+                >
+                  {getPreparationLabel(room, localBuffering)}
                 </StatusPill>
                 <StatusPill tone={room?.subtitle ? 'accent' : 'neutral'}>
                   {room?.subtitle ? '字幕已同步' : '暂无字幕'}
                 </StatusPill>
-                <StatusPill tone={localBuffering ? 'warning' : 'neutral'}>
-                  {localBuffering ? '本地缓冲中' : syncModeLabel}
+                <StatusPill tone={room?.isPreparing ? 'warning' : 'neutral'}>
+                  {room?.isPreparing
+                    ? `准备阈值 ${Math.round(room.startupBufferTargetSeconds)}s`
+                    : syncModeLabel}
                 </StatusPill>
               </div>
             </div>
@@ -1754,6 +1987,8 @@ function App() {
                     onLoadedMetadata={() => {
                       const pending = pendingPlaybackRef.current ?? playback
 
+                      publishBufferState(false, true)
+
                       if (pending) {
                         applyRemotePlayback(pending)
                       }
@@ -1768,19 +2003,26 @@ function App() {
                       if (video.currentTime === 0) {
                         video.currentTime = 0.001
                       }
+
+                      publishBufferState(false, true)
                     }}
-                    onWaiting={() => publishBufferState(true)}
-                    onStalled={() => publishBufferState(true)}
+                    onProgress={() => publishBufferState(localBufferingRef.current)}
+                    onWaiting={() => publishBufferState(true, true)}
+                    onStalled={() => publishBufferState(true, true)}
                     onCanPlay={() => {
                       if (localBufferingRef.current) {
-                        publishBufferState(false)
+                        publishBufferState(false, true)
                       }
+                    }}
+                    onCanPlayThrough={() => {
+                      canPlayThroughRef.current = true
+                      publishBufferState(false, true)
                     }}
                     onPlaying={() => {
                       setAutoplayBlocked(false)
 
                       if (localBufferingRef.current) {
-                        publishBufferState(false)
+                        publishBufferState(false, true)
                         requestFreshPlaybackState()
                       }
                     }}
@@ -1935,9 +2177,11 @@ function App() {
                 <span>同步进度</span>
                 <strong>{formatDuration(playbackPosition)}</strong>
                 <p>
-                  {playback?.playbackState.paused
-                    ? '当前为暂停状态'
-                    : '正在沿着同一条时间轴播放'}
+                  {room?.isPreparing
+                    ? '正在等待所有成员达到启动缓冲阈值'
+                    : playback?.playbackState.paused
+                      ? '当前为暂停状态'
+                      : '正在沿着同一条时间轴播放'}
                 </p>
               </article>
             </div>

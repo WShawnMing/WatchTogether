@@ -17,9 +17,9 @@ const APP_INSTANCE_ID = randomUUID()
 const DISCOVERY_PORT = Number(process.env.WATCH_TOGETHER_DISCOVERY_PORT ?? 43153)
 const DISCOVERY_INTERVAL_MS = 1_500
 const DISCOVERY_TTL_MS = 4_500
-const DISCOVERY_PROBE_CACHE_MS = 8_000
-const DISCOVERY_PROBE_TIMEOUT_MS = 450
-const DISCOVERY_PROBE_CONCURRENCY = 24
+const DISCOVERY_PROBE_CACHE_MS = 6_000
+const DISCOVERY_PROBE_TIMEOUT_MS = 300
+const DISCOVERY_PROBE_CONCURRENCY = 48
 const DISCOVERY_MAX_PROBE_HOSTS = 2_048
 const APP_DISPLAY_NAME = 'WatchTogether'
 
@@ -44,6 +44,7 @@ let hostedDiscovery: DiscoveryAdvertisePayload | null = null
 let discoveryProbePromise: Promise<Map<string, DiscoverySession>> | null = null
 let lastDiscoveryProbeAt = 0
 let cachedProbeSessions = new Map<string, DiscoverySession>()
+const successfulProbeHosts = new Set<string>()
 
 const discoveredSessions = new Map<string, DiscoverySession>()
 
@@ -156,7 +157,9 @@ function getProbeMask(prefix: number, netmask: string) {
 }
 
 function getProbeAddresses() {
-  const addresses = new Set<string>()
+  const prioritizedAddresses: string[] = []
+  const fallbackAddresses: string[] = []
+  const seenAddresses = new Set<string>()
   const localAddresses = new Set<string>()
 
   for (const network of Object.values(os.networkInterfaces())) {
@@ -182,8 +185,16 @@ function getProbeAddresses() {
         for (let candidate = networkBase + 1; candidate < broadcast; candidate += 1) {
           const ip = intToIp(candidate >>> 0)
 
-          if (!localAddresses.has(ip)) {
-            addresses.add(ip)
+          if (localAddresses.has(ip) || seenAddresses.has(ip)) {
+            continue
+          }
+
+          seenAddresses.add(ip)
+
+          if (successfulProbeHosts.has(ip)) {
+            prioritizedAddresses.push(ip)
+          } else {
+            fallbackAddresses.push(ip)
           }
         }
       } catch {
@@ -192,7 +203,7 @@ function getProbeAddresses() {
     }
   }
 
-  return [...addresses]
+  return [...prioritizedAddresses, ...fallbackAddresses]
 }
 
 async function probeAddress(address: string) {
@@ -224,6 +235,7 @@ async function probeAddress(address: string) {
     }
 
     const lastSeenAt = Date.now()
+    successfulProbeHosts.add(address)
 
     return payload.rooms.map((room) => ({
       instanceId: payload.instanceId,
@@ -281,6 +293,10 @@ async function refreshProbeSessions(force = false) {
           for (const session of sessions) {
             probedSessions.set(`${session.instanceId}:${session.roomId}`, session)
           }
+
+          if (sessions.length > 0) {
+            cachedProbeSessions = new Map(probedSessions)
+          }
         }
       },
     )
@@ -298,6 +314,23 @@ async function refreshProbeSessions(force = false) {
   } finally {
     discoveryProbePromise = null
   }
+}
+
+function getMergedDiscoverySessions() {
+  cleanupDiscoveredSessions()
+  const mergedSessions = new Map(discoveredSessions)
+
+  for (const [key, session] of cachedProbeSessions.entries()) {
+    const current = mergedSessions.get(key)
+
+    if (!current || session.lastSeenAt >= current.lastSeenAt) {
+      mergedSessions.set(key, session)
+    }
+  }
+
+  return [...mergedSessions.values()].sort((left, right) => {
+    return right.lastSeenAt - left.lastSeenAt
+  })
 }
 
 function buildAnnouncement(
@@ -620,23 +653,12 @@ ipcMain.handle(
   },
 )
 
-ipcMain.handle('discovery:list', async () => {
+ipcMain.handle('discovery:list', async (_event, options?: { force?: boolean }) => {
   await ensureDiscoverySocket()
-  cleanupDiscoveredSessions()
-  const probeSessions = await refreshProbeSessions()
-  const mergedSessions = new Map(discoveredSessions)
-
-  for (const [key, session] of probeSessions.entries()) {
-    const current = mergedSessions.get(key)
-
-    if (!current || session.lastSeenAt >= current.lastSeenAt) {
-      mergedSessions.set(key, session)
-    }
-  }
-
-  return [...mergedSessions.values()].sort((left, right) => {
-    return right.lastSeenAt - left.lastSeenAt
+  void refreshProbeSessions(options?.force === true).catch(() => {
+    // Keep discovery best-effort.
   })
+  return getMergedDiscoverySessions()
 })
 
 app.whenReady().then(() => {
