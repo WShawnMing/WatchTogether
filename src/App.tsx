@@ -360,6 +360,7 @@ function App() {
   const [subtitleOffsetY, setSubtitleOffsetY] = useState(0)
   const [subtitlePanelOpen, setSubtitlePanelOpen] = useState(false)
   const [presenceToasts, setPresenceToasts] = useState<PresenceToast[]>([])
+  const [hostedRoomId, setHostedRoomId] = useState<string | null>(null)
   const [bufferTelemetry, setBufferTelemetry] = useState<{
     estimatedMbps: number | null
     realtimeRatio: number | null
@@ -404,7 +405,9 @@ function App() {
   const currentMember =
     room?.members.find((member) => member.socketId === socketId) ?? null
   const hostMember = room?.members.find((member) => member.isHost) ?? null
-  const isHost = Boolean(currentMember?.isHost)
+  const isHost =
+    Boolean(currentMember?.isHost) ||
+    Boolean(room?.roomId && hostedRoomId && room.roomId === hostedRoomId)
   const mediaUrl =
     room?.media && room.roomId && serverUrl
       ? buildMediaUrl(serverUrl, room.roomId, room.media.id)
@@ -718,6 +721,12 @@ function App() {
       applyRemotePlayback(playback)
     }
   }, [applyRemotePlayback, playback, room?.media])
+
+  useEffect(() => {
+    if (currentMember?.isHost && room?.roomId) {
+      setHostedRoomId((current) => current ?? room.roomId)
+    }
+  }, [currentMember?.isHost, room?.roomId])
 
   useEffect(() => {
     if (!room?.subtitle || subtitleFormat !== 'ass') {
@@ -1517,6 +1526,7 @@ function App() {
     setSubtitleLabel('还没有字幕')
     setSelectedSubtitleName('')
     setJoiningRoomId(null)
+    setHostedRoomId(null)
     setPresenceToasts([])
     for (const timer of toastTimersRef.current.values()) {
       window.clearTimeout(timer)
@@ -1550,13 +1560,16 @@ function App() {
 
     try {
       const relay = await ensureLocalRelay()
+      const nextRoomId = createRoomCode()
+      setHostedRoomId(nextRoomId)
       await connectToRoom({
-        roomId: createRoomCode(),
+        roomId: nextRoomId,
         serverUrl: relay.localUrl,
         password: hostPassword,
         roomName: buildRoomName(nickname),
       })
     } catch (error) {
+      setHostedRoomId(null)
       setErrorMessage(error instanceof Error ? error.message : '启动共享失败')
     } finally {
       setRelayBusy(false)
@@ -1579,6 +1592,7 @@ function App() {
       await window.desktopApp.relay.stop()
       setRelayStatus(EMPTY_RELAY_STATUS)
       setServerUrl('')
+      setHostedRoomId(null)
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '停止共享失败')
     } finally {
@@ -1607,6 +1621,7 @@ function App() {
 
     setJoiningRoomId(sessionKey)
     setErrorMessage(null)
+    setHostedRoomId(null)
 
     try {
       await connectToRoom({
