@@ -263,6 +263,31 @@ function getBufferedAheadSeconds(video: HTMLVideoElement) {
   return 0
 }
 
+function isVideoFullyBuffered(video: HTMLVideoElement, duration: number | null) {
+  if (!duration || !Number.isFinite(duration) || duration <= 0) {
+    return false
+  }
+
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const start = video.buffered.start(index)
+    const end = video.buffered.end(index)
+
+    if (video.currentTime >= start && video.currentTime <= end) {
+      return end >= duration - 0.25
+    }
+  }
+
+  return false
+}
+
+function getMediaBitrateMbps(size: number, duration: number | null) {
+  if (!duration || !Number.isFinite(duration) || duration <= 0) {
+    return null
+  }
+
+  return (size * 8) / duration / 1_000_000
+}
+
 function getPreparationLabel(room: RoomSnapshot | null, localBuffering: boolean) {
   if (!room?.media) {
     return '等待片源'
@@ -335,6 +360,19 @@ function App() {
   const [subtitleOffsetY, setSubtitleOffsetY] = useState(0)
   const [subtitlePanelOpen, setSubtitlePanelOpen] = useState(false)
   const [presenceToasts, setPresenceToasts] = useState<PresenceToast[]>([])
+  const [bufferTelemetry, setBufferTelemetry] = useState<{
+    estimatedMbps: number | null
+    realtimeRatio: number | null
+    mediaBitrateMbps: number | null
+    etaSeconds: number | null
+    fullyBuffered: boolean
+  }>({
+    estimatedMbps: null,
+    realtimeRatio: null,
+    mediaBitrateMbps: null,
+    etaSeconds: null,
+    fullyBuffered: false,
+  })
 
   const plyrRef = useRef<Plyr | null>(null)
   const socketRef = useRef<Socket | null>(null)
@@ -357,6 +395,11 @@ function App() {
   const lastPublishedBufferStateRef = useRef('')
   const toastTimersRef = useRef<Map<string, number>>(new Map())
   const memberPresencePrimedRef = useRef(false)
+  const lastBufferSampleRef = useRef<{
+    at: number
+    currentTime: number
+    bufferAhead: number
+  } | null>(null)
 
   const currentMember =
     room?.members.find((member) => member.socketId === socketId) ?? null
@@ -384,6 +427,18 @@ function App() {
   const videoKey = `${room?.media?.id ?? 'empty'}:${room?.subtitle?.id ?? 'nosub'}`
   const isMediaUploading = uploadStatus === 'reading' || uploadStatus === 'uploading'
   const isSubtitleUploading = subtitleStatus === 'uploading'
+  const bufferTelemetryLabel = bufferTelemetry.fullyBuffered
+    ? '已缓存完成'
+    : bufferTelemetry.estimatedMbps !== null && bufferTelemetry.realtimeRatio !== null
+      ? `缓存 ${bufferTelemetry.estimatedMbps.toFixed(2)} Mbps · ${bufferTelemetry.realtimeRatio.toFixed(2)}x`
+      : '缓存速率观测中'
+  const bufferTelemetryDetail =
+    bufferTelemetry.fullyBuffered
+      ? '本地已经拿到完整片源缓存'
+      : bufferTelemetry.mediaBitrateMbps !== null &&
+          bufferTelemetry.estimatedMbps !== null
+        ? `片源码率约 ${bufferTelemetry.mediaBitrateMbps.toFixed(1)} Mbps`
+        : '等待更多缓冲样本'
   const mediaButtonLabel = isMediaUploading
     ? '上传影片中...'
     : uploadStatus === 'done'
@@ -1015,6 +1070,17 @@ function App() {
       localUserActionUntilRef.current = Date.now() + 1_500
     }
 
+    const mediaDuration = currentRoom.media?.duration ?? null
+
+    if (
+      !video.paused &&
+      mediaDuration &&
+      Number.isFinite(mediaDuration) &&
+      video.currentTime >= mediaDuration - 0.12
+    ) {
+      video.currentTime = 0
+    }
+
     socket.emit('playback:control', {
       roomId: currentRoom.roomId,
       position: video.currentTime,
@@ -1115,6 +1181,110 @@ function App() {
       window.clearInterval(interval)
     }
   }, [room?.media, room?.media?.id, room?.startupBufferTargetSeconds, socketId])
+
+  useEffect(() => {
+    const activeMedia = room?.media ?? null
+    lastBufferSampleRef.current = null
+    setBufferTelemetry({
+      estimatedMbps: null,
+      realtimeRatio: null,
+      mediaBitrateMbps: activeMedia
+        ? getMediaBitrateMbps(activeMedia.size, activeMedia.duration)
+        : null,
+      etaSeconds: null,
+      fullyBuffered: false,
+    })
+  }, [room?.media])
+
+  useEffect(() => {
+    if (!room?.media) {
+      return
+    }
+
+    const mediaBitrateMbps = getMediaBitrateMbps(
+      room.media.size,
+      room.media.duration,
+    )
+
+    const sample = () => {
+      const video = videoRef.current
+
+      if (!video || !mediaBitrateMbps) {
+        return
+      }
+
+      const now = Date.now()
+      const bufferAhead = getBufferedAheadSeconds(video)
+      const currentTime = video.currentTime
+      const fullyBuffered = isVideoFullyBuffered(video, room.media?.duration ?? null)
+      const previous = lastBufferSampleRef.current
+
+      lastBufferSampleRef.current = {
+        at: now,
+        currentTime,
+        bufferAhead,
+      }
+
+      if (!previous) {
+        setBufferTelemetry((current) => ({
+          ...current,
+          mediaBitrateMbps,
+          fullyBuffered,
+          etaSeconds: fullyBuffered
+            ? 0
+            : current.etaSeconds,
+        }))
+        return
+      }
+
+      const wallDeltaSeconds = (now - previous.at) / 1_000
+
+      if (wallDeltaSeconds < 0.4) {
+        return
+      }
+
+      const playedDelta = Math.max(0, currentTime - previous.currentTime)
+      const bufferGrowthSeconds = bufferAhead - previous.bufferAhead
+      const downloadedMediaSeconds = Math.max(
+        0,
+        bufferGrowthSeconds + playedDelta,
+      )
+      const realtimeRatio = downloadedMediaSeconds / wallDeltaSeconds
+      const estimatedMbps = mediaBitrateMbps * realtimeRatio
+      const remainingDuration = Math.max(
+        0,
+        (room.media?.duration ?? 0) - currentTime - bufferAhead,
+      )
+      const etaSeconds =
+        fullyBuffered || realtimeRatio <= 0.01
+          ? fullyBuffered
+            ? 0
+            : null
+          : remainingDuration / realtimeRatio
+
+      setBufferTelemetry((current) => ({
+        estimatedMbps:
+          current.estimatedMbps === null
+            ? estimatedMbps
+            : current.estimatedMbps * 0.55 + estimatedMbps * 0.45,
+        realtimeRatio:
+          current.realtimeRatio === null
+            ? realtimeRatio
+            : current.realtimeRatio * 0.55 + realtimeRatio * 0.45,
+        mediaBitrateMbps,
+        etaSeconds,
+        fullyBuffered,
+      }))
+    }
+
+    sample()
+
+    const interval = window.setInterval(sample, 1_000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [room?.media])
 
   useEffect(() => {
     if (connectionState !== 'connected' || !room) {
@@ -1493,11 +1663,41 @@ function App() {
         setUploadProgress(Math.round((event.loaded / event.total) * 100))
       }
 
+      request.upload.onload = () => {
+        setUploadProgress(100)
+        setUploadLabel('上传完成，正在生成差网络兼容片源')
+      }
+
       request.onload = () => {
         if (request.status >= 200 && request.status < 300) {
+          let optimizedForNetwork = false
+          let sourceBitrateMbps: number | null = null
+
+          try {
+            const payload = JSON.parse(request.responseText) as {
+              optimizedForNetwork?: boolean
+              sourceBitrateMbps?: number | null
+            }
+            optimizedForNetwork = Boolean(payload.optimizedForNetwork)
+            sourceBitrateMbps =
+              typeof payload.sourceBitrateMbps === 'number'
+                ? payload.sourceBitrateMbps
+                : null
+          } catch {
+            // Ignore malformed payloads.
+          }
+
           setUploadStatus('done')
           setUploadProgress(100)
-          setUploadLabel('片源已同步，其他人会直接从你的设备拉流')
+          setUploadLabel(
+            optimizedForNetwork
+              ? `片源已转为兼容版${
+                  sourceBitrateMbps
+                    ? `，原片约 ${sourceBitrateMbps.toFixed(1)} Mbps`
+                    : ''
+                }`
+              : '片源已同步，其他人会直接从你的设备拉流',
+          )
           resolve()
           return
         }
@@ -1882,6 +2082,20 @@ function App() {
                     ? `准备阈值 ${Math.round(room.startupBufferTargetSeconds)}s`
                     : syncModeLabel}
                 </StatusPill>
+                {room?.media ? (
+                  <StatusPill
+                    tone={
+                      bufferTelemetry.fullyBuffered
+                        ? 'success'
+                        : bufferTelemetry.realtimeRatio !== null &&
+                            bufferTelemetry.realtimeRatio >= 1
+                          ? 'accent'
+                          : 'warning'
+                    }
+                  >
+                    {bufferTelemetryLabel}
+                  </StatusPill>
+                ) : null}
               </div>
             </div>
 
@@ -2182,6 +2396,20 @@ function App() {
                     : playback?.playbackState.paused
                       ? '当前为暂停状态'
                       : '正在沿着同一条时间轴播放'}
+                </p>
+              </article>
+
+              <article className="meta-card">
+                <span>缓存观测</span>
+                <strong>{bufferTelemetryLabel}</strong>
+                <p>
+                  {bufferTelemetry.fullyBuffered
+                    ? '本地完整缓存已可直接重播'
+                    : bufferTelemetry.etaSeconds !== null
+                      ? `${bufferTelemetryDetail} · 预计 ${formatDuration(
+                          Math.max(0, bufferTelemetry.etaSeconds),
+                        )} 后缓存完剩余内容`
+                      : bufferTelemetryDetail}
                 </p>
               </article>
             </div>

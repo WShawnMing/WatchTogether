@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import {
   createReadStream,
   existsSync,
@@ -79,6 +80,13 @@ interface StartLocalRelayOptions {
   instanceId?: string
 }
 
+interface ProbedMedia {
+  duration: number | null
+  bitrate: number | null
+  videoCodec: string | null
+  audioCodec: string | null
+}
+
 export async function startLocalRelay(
   options: StartLocalRelayOptions = {},
 ): Promise<LocalRelayHandle> {
@@ -86,6 +94,9 @@ export async function startLocalRelay(
   const socketToRoom = new Map<string, string>()
   const roomIdleTtlMs = (options.roomIdleTtlMinutes ?? 120) * 60 * 1000
   const roomSnapshotHeartbeatMs = 4_000
+  const directStreamBitrateLimit = Number(
+    process.env.WATCH_TOGETHER_DIRECT_STREAM_MAX_BPS ?? 900_000,
+  )
   const uploadRoot = path.resolve(
     options.storageRoot ?? process.env.WATCH_TOGETHER_STORAGE_DIR ?? '.watchtogether/uploads',
   )
@@ -453,6 +464,156 @@ export async function startLocalRelay(
     return decodedText.startsWith('WEBVTT') ? decodedText : `WEBVTT\n\n${decodedText}`
   }
 
+  function getMediaBitrate(size: number, duration: number | null) {
+    if (!duration || !Number.isFinite(duration) || duration <= 0) {
+      return null
+    }
+
+    return Math.round((size * 8) / duration)
+  }
+
+  function runBinary(command: string, args: string[]) {
+    return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(command, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      let stdout = ''
+      let stderr = ''
+
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString()
+      })
+
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString()
+      })
+
+      child.on('error', (error) => {
+        reject(error)
+      })
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          resolve({ stdout, stderr })
+          return
+        }
+
+        reject(new Error(stderr.trim() || `${command} exited with code ${code ?? 1}`))
+      })
+    })
+  }
+
+  async function probeMedia(filePath: string): Promise<ProbedMedia> {
+    try {
+      const { stdout } = await runBinary(process.env.FFPROBE_PATH || 'ffprobe', [
+        '-v',
+        'error',
+        '-print_format',
+        'json',
+        '-show_entries',
+        'format=duration,bit_rate:stream=codec_type,codec_name',
+        filePath,
+      ])
+      const payload = JSON.parse(stdout) as {
+        format?: { duration?: string; bit_rate?: string }
+        streams?: Array<{ codec_type?: string; codec_name?: string }>
+      }
+      const videoStream = payload.streams?.find((stream) => stream.codec_type === 'video')
+      const audioStream = payload.streams?.find((stream) => stream.codec_type === 'audio')
+      const duration = Number(payload.format?.duration)
+      const bitrate = Number(payload.format?.bit_rate)
+
+      return {
+        duration: Number.isFinite(duration) ? duration : null,
+        bitrate: Number.isFinite(bitrate) ? bitrate : null,
+        videoCodec: videoStream?.codec_name ?? null,
+        audioCodec: audioStream?.codec_name ?? null,
+      }
+    } catch {
+      return {
+        duration: null,
+        bitrate: null,
+        videoCodec: null,
+        audioCodec: null,
+      }
+    }
+  }
+
+  function shouldCreateCompatibilityProxy(
+    originalName: string,
+    mimeType: string,
+    probed: ProbedMedia,
+    fallbackBitrate: number | null,
+  ) {
+    if (process.env.WATCH_TOGETHER_DISABLE_COMPAT_PROXY === '1') {
+      return false
+    }
+
+    const extension = path.extname(originalName).toLowerCase()
+    const bitrate = probed.bitrate ?? fallbackBitrate
+
+    if (['.mov', '.mkv', '.avi', '.wmv'].includes(extension)) {
+      return true
+    }
+
+    if (mimeType.includes('quicktime')) {
+      return true
+    }
+
+    if (probed.videoCodec && probed.videoCodec !== 'h264') {
+      return true
+    }
+
+    if (probed.audioCodec && !['aac', 'mp3'].includes(probed.audioCodec)) {
+      return true
+    }
+
+    return Boolean(bitrate && bitrate > directStreamBitrateLimit)
+  }
+
+  async function createCompatibilityProxy(inputPath: string, outputPath: string) {
+    await runBinary(process.env.FFMPEG_PATH || 'ffmpeg', [
+      '-y',
+      '-i',
+      inputPath,
+      '-map',
+      '0:v:0',
+      '-map',
+      '0:a?:0',
+      '-sn',
+      '-vf',
+      "scale='min(640,iw)':-2:force_original_aspect_ratio=decrease",
+      '-r',
+      '24',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-profile:v',
+      'main',
+      '-pix_fmt',
+      'yuv420p',
+      '-crf',
+      '32',
+      '-maxrate',
+      '420k',
+      '-bufsize',
+      '840k',
+      '-movflags',
+      '+faststart',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '64k',
+      '-ac',
+      '2',
+      '-ar',
+      '48000',
+      outputPath,
+    ])
+  }
+
   function deleteRoom(roomId: string) {
     const room = rooms.get(roomId)
 
@@ -785,7 +946,7 @@ export async function startLocalRelay(
     return { room, socketId }
   }
 
-  app.post('/api/rooms/:roomId/media', mediaUpload.single('video'), (request, response) => {
+  app.post('/api/rooms/:roomId/media', mediaUpload.single('video'), async (request, response) => {
     const context = resolveHostRoom(request, response)
 
     if (!context) {
@@ -803,18 +964,68 @@ export async function startLocalRelay(
     deleteSubtitle(room)
 
     const parsedDuration = Number(request.body.duration)
+    const fallbackDuration = Number.isFinite(parsedDuration) ? parsedDuration : null
+    const originalMimeType =
+      request.file.mimetype ||
+      mime.lookup(resolvedName) ||
+      'application/octet-stream'
+    let finalPath = request.file.path
+    let finalName = resolvedName
+    let finalMimeType = originalMimeType
+    let finalSize = request.file.size
+    let finalDuration = fallbackDuration
+    let optimizedForNetwork = false
+    const sourceProbe = await probeMedia(request.file.path)
+    const sourceBitrate =
+      sourceProbe.bitrate ?? getMediaBitrate(request.file.size, fallbackDuration)
+
+    if (
+      shouldCreateCompatibilityProxy(
+        resolvedName,
+        originalMimeType,
+        sourceProbe,
+        sourceBitrate,
+      )
+    ) {
+      const proxyPath = path.join(
+        path.dirname(request.file.path),
+        `${path.basename(request.file.path, path.extname(request.file.path))}-compat.mp4`,
+      )
+
+      try {
+        await createCompatibilityProxy(request.file.path, proxyPath)
+        const proxyStat = statSync(proxyPath)
+        const proxyProbe = await probeMedia(proxyPath)
+
+        finalPath = proxyPath
+        finalName = `${path.basename(resolvedName, path.extname(resolvedName))}.mp4`
+        finalMimeType = 'video/mp4'
+        finalSize = proxyStat.size
+        finalDuration = proxyProbe.duration ?? sourceProbe.duration ?? fallbackDuration
+        optimizedForNetwork = true
+
+        try {
+          rmSync(request.file.path, { force: true })
+        } catch {
+          // noop
+        }
+      } catch {
+        try {
+          rmSync(proxyPath, { force: true })
+        } catch {
+          // noop
+        }
+      }
+    }
 
     room.media = {
       id: randomUUID(),
-      name: resolvedName,
-      size: request.file.size,
-      mimeType:
-        request.file.mimetype ||
-        mime.lookup(resolvedName) ||
-        'application/octet-stream',
-      duration: Number.isFinite(parsedDuration) ? parsedDuration : null,
+      name: finalName,
+      size: finalSize,
+      mimeType: finalMimeType,
+      duration: finalDuration,
       uploadedAt: Date.now(),
-      filePath: request.file.path,
+      filePath: finalPath,
     }
 
     for (const member of room.members.values()) {
@@ -851,6 +1062,8 @@ export async function startLocalRelay(
         duration: room.media.duration,
         uploadedAt: room.media.uploadedAt,
       },
+      optimizedForNetwork,
+      sourceBitrateMbps: sourceBitrate ? sourceBitrate / 1_000_000 : null,
     })
   })
 
