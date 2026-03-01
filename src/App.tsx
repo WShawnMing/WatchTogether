@@ -24,7 +24,6 @@ import {
   type PlaybackEnvelope,
   type PlaybackReason,
   type RoomSnapshot,
-  type SyncMode,
 } from '../shared/protocol'
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
@@ -420,10 +419,12 @@ function App() {
   const localMediaUrlRef = useRef<string | null>(null)
   const joinPayloadRef = useRef<JoinRoomPayload | null>(null)
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
+  const playbackRef = useRef<PlaybackEnvelope | null>(null)
   const suppressEventsRef = useRef(false)
   const suppressTimeoutRef = useRef<number | null>(null)
   const localBufferingRef = useRef(false)
   const localUserActionUntilRef = useRef(0)
+  const localSeekingRef = useRef(false)
   const manualDisconnectRef = useRef(false)
   const lastRoomSnapshotAtRef = useRef(0)
   const lastPlaybackStateAtRef = useRef(0)
@@ -452,8 +453,6 @@ function App() {
       : null
   const subtitleFormat = room?.subtitle?.format ?? null
   const audienceCount = room?.members.length ?? 0
-  const syncMode = room?.syncMode ?? 'soft'
-  const syncModeLabel = syncMode === 'strict' ? '严格同步' : '柔性同步'
   const playbackPosition = playback
     ? deriveCurrentPosition(playback.playbackState, playback.serverTime)
     : 0
@@ -472,15 +471,6 @@ function App() {
         : bufferTelemetry.estimatedMbps !== null && bufferTelemetry.realtimeRatio !== null
           ? `缓存 ${bufferTelemetry.estimatedMbps.toFixed(2)} Mbps · ${bufferTelemetry.realtimeRatio.toFixed(2)}x`
           : '缓存速率观测中'
-  const bufferTelemetryDetail =
-    room?.media && !localMediaMatchesRoom
-      ? '先选择与房主一致的本地文件'
-      : bufferTelemetry.fullyBuffered
-        ? '本地已经拿到完整片源缓存'
-        : bufferTelemetry.mediaBitrateMbps !== null &&
-            bufferTelemetry.estimatedMbps !== null
-          ? `片源码率约 ${bufferTelemetry.mediaBitrateMbps.toFixed(1)} Mbps`
-          : '等待更多缓冲样本'
   const mediaButtonLabel = isMediaUploading
     ? '校验片源中...'
     : uploadStatus === 'done'
@@ -509,6 +499,10 @@ function App() {
   useEffect(() => {
     roomRef.current = room
   }, [room])
+
+  useEffect(() => {
+    playbackRef.current = playback
+  }, [playback])
 
   useEffect(() => {
     const savedNickname = window.localStorage.getItem('watchtogether:nickname')
@@ -715,6 +709,11 @@ function App() {
         return
       }
 
+      if (localSeekingRef.current) {
+        pendingPlaybackRef.current = incoming
+        return
+      }
+
       const targetTime = Math.max(
         deriveCurrentPosition(incoming.playbackState, incoming.serverTime),
         0,
@@ -851,6 +850,11 @@ function App() {
         focused: true,
         global: true,
       },
+      muted: false,
+      volume: 1,
+      storage: {
+        enabled: false,
+      },
       seekTime: 5,
       tooltips: {
         controls: true,
@@ -859,6 +863,9 @@ function App() {
     })
 
     plyrRef.current = player
+    player.muted = false
+    video.muted = false
+    video.volume = Math.max(video.volume, 0.8)
 
     return () => {
       player.destroy()
@@ -1021,6 +1028,7 @@ function App() {
   const handleSnapshot = (snapshot: RoomSnapshot) => {
     lastRoomSnapshotAtRef.current = Date.now()
     const previousRoom = roomRef.current
+    const previousPlayback = playbackRef.current
     const previousMediaId = roomRef.current?.media?.id ?? null
     const nextMediaId = snapshot.media?.id ?? null
     const nextSelfMember =
@@ -1101,11 +1109,22 @@ function App() {
 
     roomRef.current = snapshot
     memberPresencePrimedRef.current = true
+    const nextPlayback = roomSnapshotToPlayback(snapshot)
+    const shouldAdoptSnapshotPlayback =
+      !previousPlayback ||
+      nextPlayback.playbackState.updatedAt >= previousPlayback.playbackState.updatedAt
 
     startTransition(() => {
       setRoom(snapshot)
-      setPlayback(roomSnapshotToPlayback(snapshot))
+
+      if (shouldAdoptSnapshotPlayback) {
+        setPlayback(nextPlayback)
+      }
     })
+
+    if (shouldAdoptSnapshotPlayback) {
+      playbackRef.current = nextPlayback
+    }
 
     if (snapshot.subtitle) {
       setSelectedSubtitleName(snapshot.subtitle.name)
@@ -1142,6 +1161,7 @@ function App() {
 
   const handlePlayback = (incoming: PlaybackEnvelope) => {
     lastPlaybackStateAtRef.current = Date.now()
+    playbackRef.current = incoming
     startTransition(() => {
       setPlayback(incoming)
     })
@@ -1552,6 +1572,10 @@ function App() {
         setConnectionState('reconnecting')
       })
 
+      nextSocket.io.on('reconnect_failed', () => {
+        disconnectFromRoom('房主已离开或房间已失效')
+      })
+
       nextSocket.on('disconnect', () => {
         setSocketId('')
         memberPresencePrimedRef.current = false
@@ -1576,16 +1600,22 @@ function App() {
         setErrorMessage(message)
       })
 
+      nextSocket.on('room:closed', (message?: string) => {
+        disconnectFromRoom(message ?? '房主已离开，房间已关闭')
+      })
+
       nextSocket.connect()
     })
   }
 
-  const disconnectFromRoom = () => {
+  const disconnectFromRoom = (nextErrorMessage: string | null = null) => {
     manualDisconnectRef.current = true
     joinPayloadRef.current = null
     pendingPlaybackRef.current = null
+    playbackRef.current = null
     localBufferingRef.current = false
     localUserActionUntilRef.current = 0
+    localSeekingRef.current = false
     lastRoomSnapshotAtRef.current = 0
     lastPlaybackStateAtRef.current = 0
     canPlayThroughRef.current = false
@@ -1596,7 +1626,7 @@ function App() {
     setConnectionState('idle')
     setRoom(null)
     setPlayback(null)
-    setErrorMessage(null)
+    setErrorMessage(nextErrorMessage)
     setLocalBuffering(false)
     setAutoplayBlocked(false)
     setUploadStatus('idle')
@@ -2039,10 +2069,6 @@ function App() {
                   <strong>{room.roomName}</strong>
                 </div>
                 <div className="summary-item">
-                  <span>同步模式</span>
-                  <strong>{syncModeLabel}</strong>
-                </div>
-                <div className="summary-item">
                   <span>在线成员</span>
                   <strong>{audienceCount}</strong>
                 </div>
@@ -2080,36 +2106,6 @@ function App() {
                 ))}
               </div>
 
-              {isHost ? (
-                <div className="segment">
-                  <button
-                    className={`segment__button ${
-                      syncMode === 'soft' ? 'segment__button--active' : ''
-                    }`}
-                    onClick={() => {
-                      socketRef.current?.emit('room:config', {
-                        roomId: room.roomId,
-                        syncMode: 'soft' as SyncMode,
-                      })
-                    }}
-                  >
-                    柔性同步
-                  </button>
-                  <button
-                    className={`segment__button ${
-                      syncMode === 'strict' ? 'segment__button--active' : ''
-                    }`}
-                    onClick={() => {
-                      socketRef.current?.emit('room:config', {
-                        roomId: room.roomId,
-                        syncMode: 'strict' as SyncMode,
-                      })
-                    }}
-                  >
-                    严格同步
-                  </button>
-                </div>
-              ) : null}
             </section>
           ) : null}
         </aside>
@@ -2141,11 +2137,6 @@ function App() {
                 </StatusPill>
                 <StatusPill tone={room?.subtitle ? 'accent' : 'neutral'}>
                   {room?.subtitle ? '字幕已同步' : '暂无字幕'}
-                </StatusPill>
-                <StatusPill tone={room?.isPreparing ? 'warning' : 'neutral'}>
-                  {room?.isPreparing
-                    ? `准备阈值 ${Math.round(room.startupBufferTargetSeconds)}s`
-                    : syncModeLabel}
                 </StatusPill>
                 {room?.media ? (
                   <StatusPill
@@ -2261,9 +2252,15 @@ function App() {
                       publishPlaybackIntent('user')
                     }}
                     onSeeking={() => {
+                      localSeekingRef.current = true
+                      pendingPlaybackRef.current = null
                       localUserActionUntilRef.current = Date.now() + 1500
                     }}
-                    onSeeked={() => publishPlaybackIntent('user')}
+                    onSeeked={() => {
+                      localSeekingRef.current = false
+                      localUserActionUntilRef.current = Date.now() + 2200
+                      publishPlaybackIntent('user')
+                    }}
                     onRateChange={() => publishPlaybackIntent('user')}
                     onLoadedMetadata={() => {
                       const pending = pendingPlaybackRef.current ?? playback
@@ -2472,19 +2469,6 @@ function App() {
                 </p>
               </article>
 
-              <article className="meta-card">
-                <span>缓存观测</span>
-                <strong>{bufferTelemetryLabel}</strong>
-                <p>
-                  {bufferTelemetry.fullyBuffered
-                    ? '本地完整缓存已可直接重播'
-                    : bufferTelemetry.etaSeconds !== null
-                      ? `${bufferTelemetryDetail} · 预计 ${formatDuration(
-                          Math.max(0, bufferTelemetry.etaSeconds),
-                        )} 后缓存完剩余内容`
-                      : bufferTelemetryDetail}
-                </p>
-              </article>
             </div>
 
             {room ? (

@@ -786,13 +786,26 @@ export async function startLocalRelay(
       return
     }
 
+    const wasHost = room.hostSocketId === socketId
     room.members.delete(socketId)
     room.lastActiveAt = Date.now()
-    reassignHostIfNeeded(room)
 
     if (room.members.size === 0) {
+      deleteRoom(roomId)
       return
     }
+
+    if (wasHost) {
+      for (const memberId of room.members.keys()) {
+        socketToRoom.delete(memberId)
+      }
+
+      io.to(room.id).emit('room:closed', '房主已离开，房间已关闭')
+      deleteRoom(roomId)
+      return
+    }
+
+    reassignHostIfNeeded(room)
 
     syncMemberStartupReadiness(room)
     emitRoomSnapshot(io, room)
