@@ -472,6 +472,83 @@ export async function startLocalRelay(
     return buffer.toString('utf8').replace(/^\uFEFF/, '').replace(/\r+/g, '')
   }
 
+  function isProbablyBinarySubtitle(buffer: Buffer) {
+    const sample = buffer.subarray(0, Math.min(buffer.length, 4096))
+
+    if (sample.includes(0)) {
+      return true
+    }
+
+    let suspicious = 0
+
+    for (const byte of sample) {
+      if (byte === 9 || byte === 10 || byte === 13) {
+        continue
+      }
+
+      if (byte < 32) {
+        suspicious += 1
+      }
+    }
+
+    return sample.length > 0 && suspicious / sample.length > 0.02
+  }
+
+  function isProbablyValidAssSubtitle(text: string) {
+    const normalized = text.replace(/^\uFEFF/, '').replace(/\r+/g, '')
+
+    return (
+      /\[Script Info\]/i.test(normalized) &&
+      /\[Events\]/i.test(normalized) &&
+      /(Dialogue|Comment)\s*:/i.test(normalized)
+    )
+  }
+
+  function isProbablyValidSrtSubtitle(text: string) {
+    const normalized = text.replace(/^\uFEFF/, '').replace(/\r+/g, '')
+
+    return /\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}/.test(normalized)
+  }
+
+  function isProbablyValidVttSubtitle(text: string) {
+    const normalized = text.replace(/^\uFEFF/, '').replace(/\r+/g, '')
+
+    if (/^WEBVTT\b/i.test(normalized)) {
+      return true
+    }
+
+    return /-->/i.test(normalized)
+  }
+
+  function validateSubtitlePayload(buffer: Buffer, originalName: string) {
+    if (isProbablyBinarySubtitle(buffer)) {
+      throw new Error('字幕文件内容不是可解析的文本，请重新选择正确的字幕文件。')
+    }
+
+    const extension = path.extname(originalName).toLowerCase()
+    const decodedText = normalizeSubtitleText(buffer)
+
+    if (['.ass', '.ssa'].includes(extension)) {
+      if (!isProbablyValidAssSubtitle(decodedText)) {
+        throw new Error('字幕文件内容与 .ass/.ssa 扩展名不匹配。')
+      }
+
+      return
+    }
+
+    if (extension === '.srt') {
+      if (!isProbablyValidSrtSubtitle(decodedText)) {
+        throw new Error('字幕文件内容与 .srt 扩展名不匹配。')
+      }
+
+      return
+    }
+
+    if (!isProbablyValidVttSubtitle(decodedText)) {
+      throw new Error('字幕文件内容与 .vtt 扩展名不匹配。')
+    }
+  }
+
   function getSubtitleFormat(originalName: string) {
     const extension = path.extname(originalName).toLowerCase()
 
@@ -1199,6 +1276,18 @@ export async function startLocalRelay(
 
       if (!['.srt', '.vtt', '.ass', '.ssa'].includes(extension)) {
         response.status(400).json({ error: '目前只支持 .srt、.vtt、.ass 和 .ssa 字幕' })
+        return
+      }
+
+      try {
+        validateSubtitlePayload(request.file.buffer, originalName)
+      } catch (error) {
+        response.status(400).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : '字幕文件内容无效或与扩展名不匹配',
+        })
         return
       }
 

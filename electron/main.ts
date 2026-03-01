@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createSocket, type RemoteInfo, type Socket as DiscoverySocket } from 'node:dgram'
 import { app, BrowserWindow, ipcMain, nativeImage } from 'electron'
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync, mkdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import type {
   DiscoveryAdvertisePayload,
   DiscoveryAnnouncement,
@@ -54,6 +55,21 @@ type LocalRelayHandle = {
   port: number
 }
 
+type ProbedMedia = {
+  duration: number | null
+  videoCodec: string | null
+  audioCodec: string | null
+}
+
+type PreparedPlaybackSource = {
+  playableUrl: string
+  source: 'original' | 'proxy'
+  duration: number | null
+  videoCodec: string | null
+  audioCodec: string | null
+  warning: string | null
+}
+
 function hashFileSha256(filePath: string) {
   return new Promise<string>((resolve, reject) => {
     const hash = createHash('sha256')
@@ -69,6 +85,195 @@ function hashFileSha256(filePath: string) {
       resolve(hash.digest('hex'))
     })
   })
+}
+
+function runBinary(command: string, args: string[]) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString()
+    })
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+
+    child.on('error', (error) => {
+      reject(error)
+    })
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr })
+        return
+      }
+
+      reject(new Error(stderr.trim() || `${command} exited with code ${code ?? 1}`))
+    })
+  })
+}
+
+async function probeMedia(filePath: string): Promise<ProbedMedia> {
+  try {
+    const { stdout } = await runBinary(process.env.FFPROBE_PATH || 'ffprobe', [
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-show_entries',
+      'format=duration:stream=codec_type,codec_name',
+      filePath,
+    ])
+    const payload = JSON.parse(stdout) as {
+      format?: { duration?: string }
+      streams?: Array<{ codec_type?: string; codec_name?: string }>
+    }
+    const duration = Number(payload.format?.duration)
+    const videoStream = payload.streams?.find((stream) => stream.codec_type === 'video')
+    const audioStream = payload.streams?.find((stream) => stream.codec_type === 'audio')
+
+    return {
+      duration: Number.isFinite(duration) ? duration : null,
+      videoCodec: videoStream?.codec_name ?? null,
+      audioCodec: audioStream?.codec_name ?? null,
+    }
+  } catch {
+    return {
+      duration: null,
+      videoCodec: null,
+      audioCodec: null,
+    }
+  }
+}
+
+function normalizeCacheBaseName(fileName: string) {
+  return path
+    .basename(fileName, path.extname(fileName))
+    .replace(/[^\w\u4e00-\u9fa5.-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 72)
+}
+
+function needsLocalCompatibilityProxy(
+  originalName: string,
+  mimeType: string,
+  probed: ProbedMedia,
+) {
+  const extension = path.extname(originalName).toLowerCase()
+
+  if (['.mkv', '.avi', '.wmv'].includes(extension)) {
+    return true
+  }
+
+  if (mimeType.includes('quicktime')) {
+    return true
+  }
+
+  if (probed.videoCodec && !['h264', 'vp8', 'vp9', 'av1', 'theora'].includes(probed.videoCodec)) {
+    return true
+  }
+
+  if (probed.audioCodec && !['aac', 'mp3', 'opus', 'vorbis'].includes(probed.audioCodec)) {
+    return true
+  }
+
+  return false
+}
+
+async function createLocalCompatibilityProxy(inputPath: string, outputPath: string) {
+  await runBinary(process.env.FFMPEG_PATH || 'ffmpeg', [
+    '-y',
+    '-i',
+    inputPath,
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?:0',
+    '-sn',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-profile:v',
+    'main',
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '160k',
+    '-ac',
+    '2',
+    '-ar',
+    '48000',
+    outputPath,
+  ])
+}
+
+async function preparePlaybackSource(options: {
+  filePath: string
+  originalName: string
+  mimeType: string
+  sha256?: string
+}): Promise<PreparedPlaybackSource> {
+  const originalUrl = pathToFileURL(options.filePath).toString()
+  const probed = await probeMedia(options.filePath)
+
+  if (!needsLocalCompatibilityProxy(options.originalName, options.mimeType, probed)) {
+    return {
+      playableUrl: originalUrl,
+      source: 'original',
+      duration: probed.duration,
+      videoCodec: probed.videoCodec,
+      audioCodec: probed.audioCodec,
+      warning: null,
+    }
+  }
+
+  try {
+    const cacheRoot = path.join(app.getPath('userData'), 'local-media-cache')
+    mkdirSync(cacheRoot, { recursive: true })
+    const outputPath = path.join(
+      cacheRoot,
+      `${options.sha256 || randomUUID()}-${normalizeCacheBaseName(options.originalName) || 'media'}-compat.mp4`,
+    )
+
+    if (!existsSync(outputPath)) {
+      await createLocalCompatibilityProxy(options.filePath, outputPath)
+    }
+
+    const proxyProbe = await probeMedia(outputPath)
+
+    return {
+      playableUrl: pathToFileURL(outputPath).toString(),
+      source: 'proxy',
+      duration: proxyProbe.duration ?? probed.duration,
+      videoCodec: proxyProbe.videoCodec ?? probed.videoCodec,
+      audioCodec: proxyProbe.audioCodec ?? probed.audioCodec,
+      warning: '已自动切换到本地兼容播放版本，避免无声或黑屏。',
+    }
+  } catch (error) {
+    return {
+      playableUrl: originalUrl,
+      source: 'original',
+      duration: probed.duration,
+      videoCodec: probed.videoCodec,
+      audioCodec: probed.audioCodec,
+      warning:
+        error instanceof Error
+          ? `本地兼容播放准备失败，已回退到原文件：${error.message}`
+          : '本地兼容播放准备失败，已回退到原文件。',
+    }
+  }
 }
 
 function getRuntimeIconPath() {
@@ -658,6 +863,21 @@ ipcMain.handle('files:hash-sha256', async (_event, filePath: string) => {
     sha256: await hashFileSha256(filePath),
   }
 })
+
+ipcMain.handle(
+  'files:prepare-playback',
+  async (
+    _event,
+    options: {
+      filePath: string
+      originalName: string
+      mimeType: string
+      sha256?: string
+    },
+  ) => {
+    return preparePlaybackSource(options)
+  },
+)
 
 ipcMain.handle(
   'discovery:advertise',

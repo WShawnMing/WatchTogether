@@ -30,6 +30,19 @@ declare global {
         hashSha256: (filePath: string) => Promise<{
           sha256: string
         }>
+        preparePlayback: (options: {
+          filePath: string
+          originalName: string
+          mimeType: string
+          sha256?: string
+        }) => Promise<{
+          playableUrl: string
+          source: 'original' | 'proxy'
+          duration: number | null
+          videoCodec: string | null
+          audioCodec: string | null
+          warning: string | null
+        }>
       }
       discovery: {
         advertise: (

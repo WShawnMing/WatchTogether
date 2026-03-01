@@ -28,7 +28,7 @@ import {
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
 type UploadStatus = 'idle' | 'reading' | 'uploading' | 'done' | 'error'
-type SubtitleStatus = 'idle' | 'uploading' | 'done' | 'error'
+type SubtitleStatus = 'idle' | 'done' | 'error'
 
 interface LocalFileWithPath extends File {
   path?: string
@@ -53,6 +53,15 @@ interface PresenceToast {
   id: string
   title: string
   detail: string
+}
+
+interface PreparedPlaybackSource {
+  playableUrl: string
+  source: 'original' | 'proxy'
+  duration: number | null
+  videoCodec: string | null
+  audioCodec: string | null
+  warning: string | null
 }
 
 const EMPTY_RELAY_STATUS: RelayStatus = {
@@ -149,13 +158,6 @@ function isTextEntryTarget(target: EventTarget | null) {
   return false
 }
 
-function buildSubtitleUrl(serverUrl: string, roomId: string, subtitleId: string) {
-  return new URL(
-    `/api/rooms/${roomId}/subtitles/${subtitleId}`,
-    `${normalizeServerUrl(serverUrl)}/`,
-  ).toString()
-}
-
 function roomSnapshotToPlayback(snapshot: RoomSnapshot): PlaybackEnvelope {
   return {
     roomId: snapshot.roomId,
@@ -212,6 +214,20 @@ async function hashFileSha256(file: LocalFileWithPath) {
     .join('')
 }
 
+function releaseLocalMediaUrl(url: string | null) {
+  if (url?.startsWith('blob:')) {
+    URL.revokeObjectURL(url)
+  }
+}
+
+function buildPresenceEventKey(
+  roomId: string,
+  verb: 'join' | 'leave',
+  socketIds: string[],
+) {
+  return `${roomId}:${verb}:${socketIds.sort().join(',')}`
+}
+
 function getPlaybackLabel(state: DiscoveryPlaybackState) {
   switch (state) {
     case 'playing':
@@ -243,16 +259,16 @@ function buildRoomName(nickname: string) {
 
 function formatSupportHint(mediaName?: string | null) {
   if (!mediaName) {
-    return '房主先选择本地片源，其他成员选择相同文件后即可只同步进度，不再传视频。'
+    return '房主先选择本地片源，其他成员选择相同文件后即可只同步进度。字幕各自本地加载，不会上传。'
   }
 
   const extension = mediaName.split('.').pop()?.toLowerCase() ?? ''
 
   if (['mkv', 'avi', 'wmv'].includes(extension)) {
-    return '当前房间只同步进度。若本地无法播放，通常是编码不被内置播放器支持，建议优先使用 H.264/AAC。'
+    return '当前房间只同步进度。字幕各自本地加载。若本地无法播放，通常是编码不被内置播放器支持，建议优先使用 H.264/AAC。'
   }
 
-  return '所有成员选择相同本地文件后，只同步时间轴和播放控制。'
+  return '所有成员选择相同本地文件后，只同步时间轴和播放控制。字幕各自本地加载。'
 }
 
 function getBufferedAheadSeconds(video: HTMLVideoElement) {
@@ -383,10 +399,11 @@ function App() {
   const [selectedFileName, setSelectedFileName] = useState('')
   const [localMediaDescriptor, setLocalMediaDescriptor] = useState<MediaDescriptor | null>(null)
   const [localMediaUrl, setLocalMediaUrl] = useState<string | null>(null)
-  const [subtitleStatus, setSubtitleStatus] =
-    useState<SubtitleStatus>('idle')
-  const [subtitleLabel, setSubtitleLabel] = useState('还没有字幕')
+  const [subtitleStatus, setSubtitleStatus] = useState<SubtitleStatus>('idle')
+  const [subtitleLabel, setSubtitleLabel] = useState('还没有选择本地字幕')
   const [selectedSubtitleName, setSelectedSubtitleName] = useState('')
+  const [localSubtitleUrl, setLocalSubtitleUrl] = useState<string | null>(null)
+  const [localSubtitleFormat, setLocalSubtitleFormat] = useState<'vtt' | 'ass' | null>(null)
   const [relayBusy, setRelayBusy] = useState(false)
   const [joiningRoomId, setJoiningRoomId] = useState<string | null>(null)
   const [subtitleScale, setSubtitleScale] = useState(1)
@@ -417,6 +434,7 @@ function App() {
   const subtitleLayerRef = useRef<HTMLDivElement | null>(null)
   const assRendererRef = useRef<ASSRenderer | null>(null)
   const localMediaUrlRef = useRef<string | null>(null)
+  const localSubtitleUrlRef = useRef<string | null>(null)
   const joinPayloadRef = useRef<JoinRoomPayload | null>(null)
   const pendingPlaybackRef = useRef<PlaybackEnvelope | null>(null)
   const playbackRef = useRef<PlaybackEnvelope | null>(null)
@@ -432,6 +450,7 @@ function App() {
   const lastPublishedBufferStateRef = useRef('')
   const toastTimersRef = useRef<Map<string, number>>(new Map())
   const memberPresencePrimedRef = useRef(false)
+  const recentPresenceEventsRef = useRef<Map<string, number>>(new Map())
   const lastBufferSampleRef = useRef<{
     at: number
     currentTime: number
@@ -447,11 +466,8 @@ function App() {
   const localMediaMatchesRoom =
     Boolean(room?.media && localMediaDescriptor && room.media.sha256 === localMediaDescriptor.sha256)
   const mediaUrl = room?.media && localMediaMatchesRoom ? localMediaUrl : null
-  const subtitleUrl =
-    room?.subtitle && room.roomId && serverUrl
-      ? buildSubtitleUrl(serverUrl, room.roomId, room.subtitle.id)
-      : null
-  const subtitleFormat = room?.subtitle?.format ?? null
+  const subtitleUrl = localSubtitleUrl
+  const subtitleFormat = localSubtitleFormat
   const audienceCount = room?.members.length ?? 0
   const playbackPosition = playback
     ? deriveCurrentPosition(playback.playbackState, playback.serverTime)
@@ -460,9 +476,8 @@ function App() {
     connectionState,
     relayStatus.running,
   )
-  const videoKey = `${room?.media?.id ?? 'empty'}:${localMediaDescriptor?.sha256 ?? 'nomatch'}:${room?.subtitle?.id ?? 'nosub'}`
+  const videoKey = `${room?.media?.id ?? 'empty'}:${localMediaDescriptor?.sha256 ?? 'nomatch'}:${selectedSubtitleName || 'nosub'}`
   const isMediaUploading = uploadStatus === 'reading' || uploadStatus === 'uploading'
-  const isSubtitleUploading = subtitleStatus === 'uploading'
   const bufferTelemetryLabel =
     room?.media && !localMediaMatchesRoom
       ? '等待本地匹配'
@@ -482,19 +497,16 @@ function App() {
         : isHost
           ? '选择本地影片'
           : '匹配本地影片'
-  const subtitleButtonLabel = isSubtitleUploading
-    ? '上传字幕中...'
-    : subtitleStatus === 'done'
-      ? '字幕已更新'
+  const subtitleButtonLabel = subtitleStatus === 'done'
+      ? '字幕已载入'
       : subtitleStatus === 'error'
-        ? '重试字幕上传'
-        : '上传字幕'
+        ? '重试选择字幕'
+        : '选择字幕'
   const mediaButtonMeta =
     selectedFileName ||
     room?.media?.name ||
     (isHost ? '选择要分享的本地文件' : '选择与你朋友相同的本地文件')
-  const subtitleButtonMeta =
-    selectedSubtitleName || room?.subtitle?.name || '.srt / .vtt / .ass'
+  const subtitleButtonMeta = selectedSubtitleName || '仅在当前设备生效'
 
   useEffect(() => {
     roomRef.current = room
@@ -548,9 +560,8 @@ function App() {
 
   useEffect(() => {
     return () => {
-      if (localMediaUrlRef.current) {
-        URL.revokeObjectURL(localMediaUrlRef.current)
-      }
+      releaseLocalMediaUrl(localMediaUrlRef.current)
+      releaseLocalMediaUrl(localSubtitleUrlRef.current)
     }
   }, [])
 
@@ -649,7 +660,7 @@ function App() {
       memberCount: room.members.length,
       maxMembers: room.maxMembers,
       mediaName: room.media?.name ?? null,
-      subtitleName: room.subtitle?.name ?? null,
+      subtitleName: null,
       playbackState: room.media
         ? playback?.playbackState.paused
           ? 'paused'
@@ -782,10 +793,10 @@ function App() {
   }, [currentMember?.isHost, room?.roomId])
 
   useEffect(() => {
-    if (!room?.subtitle || subtitleFormat !== 'ass') {
+    if (!subtitleUrl || subtitleFormat !== 'ass') {
       setSubtitlePanelOpen(false)
     }
-  }, [room?.subtitle, subtitleFormat])
+  }, [subtitleFormat, subtitleUrl])
 
   useEffect(() => {
     if (!subtitlePanelOpen) {
@@ -1006,6 +1017,7 @@ function App() {
 
   useEffect(() => {
     const toastTimers = toastTimersRef.current
+    const recentPresenceEvents = recentPresenceEventsRef.current
 
     return () => {
       if (suppressTimeoutRef.current !== null) {
@@ -1017,6 +1029,7 @@ function App() {
       }
 
       toastTimers.clear()
+      recentPresenceEvents.clear()
 
       plyrRef.current?.destroy()
       assRendererRef.current?.destroy()
@@ -1051,6 +1064,14 @@ function App() {
       memberPresencePrimedRef.current &&
       previousRoom?.roomId === snapshot.roomId
     ) {
+      const now = Date.now()
+
+      for (const [eventKey, seenAt] of recentPresenceEventsRef.current.entries()) {
+        if (now - seenAt > 4_000) {
+          recentPresenceEventsRef.current.delete(eventKey)
+        }
+      }
+
       const previousMembers = new Map(
         previousRoom.members.map((member) => [member.socketId, member]),
       )
@@ -1065,45 +1086,63 @@ function App() {
         .filter((member) => member.socketId !== socketId)
 
       if (joinedMembers.length > 0) {
-        const toastId = `${Date.now()}-join-${joinedMembers.map((member) => member.socketId).join('-')}`
-        const timer = window.setTimeout(() => {
-          setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
-          toastTimersRef.current.delete(toastId)
-        }, 2600)
+        const eventKey = buildPresenceEventKey(
+          snapshot.roomId,
+          'join',
+          joinedMembers.map((member) => member.socketId),
+        )
 
-        toastTimersRef.current.set(toastId, timer)
-        setPresenceToasts((current) => [
-          ...current.slice(-2),
-          {
-            id: toastId,
-            title: formatPresenceSummary(
-              joinedMembers.map((member) => member.nickname),
-              '加入',
-            ),
-            detail: '已加入当前放映室',
-          },
-        ])
+        if (!recentPresenceEventsRef.current.has(eventKey)) {
+          recentPresenceEventsRef.current.set(eventKey, now)
+          const toastId = `${now}-join-${joinedMembers.map((member) => member.socketId).join('-')}`
+          const timer = window.setTimeout(() => {
+            setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
+            toastTimersRef.current.delete(toastId)
+          }, 2600)
+
+          toastTimersRef.current.set(toastId, timer)
+          setPresenceToasts((current) => [
+            ...current.slice(-2),
+            {
+              id: toastId,
+              title: formatPresenceSummary(
+                joinedMembers.map((member) => member.nickname),
+                '加入',
+              ),
+              detail: '已加入当前放映室',
+            },
+          ])
+        }
       }
 
       if (leftMembers.length > 0) {
-        const toastId = `${Date.now()}-leave-${leftMembers.map((member) => member.socketId).join('-')}`
-        const timer = window.setTimeout(() => {
-          setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
-          toastTimersRef.current.delete(toastId)
-        }, 2600)
+        const eventKey = buildPresenceEventKey(
+          snapshot.roomId,
+          'leave',
+          leftMembers.map((member) => member.socketId),
+        )
 
-        toastTimersRef.current.set(toastId, timer)
-        setPresenceToasts((current) => [
-          ...current.slice(-2),
-          {
-            id: toastId,
-            title: formatPresenceSummary(
-              leftMembers.map((member) => member.nickname),
-              '离开',
-            ),
-            detail: '已离开当前放映室',
-          },
-        ])
+        if (!recentPresenceEventsRef.current.has(eventKey)) {
+          recentPresenceEventsRef.current.set(eventKey, now)
+          const toastId = `${now}-leave-${leftMembers.map((member) => member.socketId).join('-')}`
+          const timer = window.setTimeout(() => {
+            setPresenceToasts((current) => current.filter((item) => item.id !== toastId))
+            toastTimersRef.current.delete(toastId)
+          }, 2600)
+
+          toastTimersRef.current.set(toastId, timer)
+          setPresenceToasts((current) => [
+            ...current.slice(-2),
+            {
+              id: toastId,
+              title: formatPresenceSummary(
+                leftMembers.map((member) => member.nickname),
+                '离开',
+              ),
+              detail: '已离开当前放映室',
+            },
+          ])
+        }
       }
     }
 
@@ -1124,14 +1163,6 @@ function App() {
 
     if (shouldAdoptSnapshotPlayback) {
       playbackRef.current = nextPlayback
-    }
-
-    if (snapshot.subtitle) {
-      setSelectedSubtitleName(snapshot.subtitle.name)
-      setSubtitleLabel('字幕已同步给所有人')
-    } else {
-      setSelectedSubtitleName('')
-      setSubtitleLabel('还没有字幕')
     }
 
     if (!snapshot.media) {
@@ -1634,17 +1665,20 @@ function App() {
     setUploadLabel('还没有选择本地片源')
     setSelectedFileName('')
     setLocalMediaDescriptor(null)
-    if (localMediaUrlRef.current) {
-      URL.revokeObjectURL(localMediaUrlRef.current)
-      localMediaUrlRef.current = null
-    }
+    releaseLocalMediaUrl(localMediaUrlRef.current)
+    localMediaUrlRef.current = null
     setLocalMediaUrl(null)
     setSubtitleStatus('idle')
-    setSubtitleLabel('还没有字幕')
+    setSubtitleLabel('还没有选择本地字幕')
     setSelectedSubtitleName('')
+    releaseLocalMediaUrl(localSubtitleUrlRef.current)
+    localSubtitleUrlRef.current = null
+    setLocalSubtitleUrl(null)
+    setLocalSubtitleFormat(null)
     setJoiningRoomId(null)
     setHostedRoomId(null)
     setPresenceToasts([])
+    recentPresenceEventsRef.current.clear()
     for (const timer of toastTimersRef.current.values()) {
       window.clearTimeout(timer)
     }
@@ -1756,6 +1790,7 @@ function App() {
   const uploadMedia = async (file: File) => {
     const socket = socketRef.current
     const currentRoom = roomRef.current
+    const localFile = file as LocalFileWithPath
 
     if (!socket || !currentRoom) {
       setErrorMessage('请先加入房间，再选择本地片源')
@@ -1769,11 +1804,25 @@ function App() {
     setErrorMessage(null)
 
     try {
-      const duration = await readVideoDuration(file)
+      const durationPromise = readVideoDuration(file)
       setUploadStatus('uploading')
       setUploadProgress(55)
       setUploadLabel('正在校验本地文件指纹')
-      const sha256 = await hashFileSha256(file as LocalFileWithPath)
+      const sha256 = await hashFileSha256(localFile)
+      let preparedPlayback: PreparedPlaybackSource | null = null
+
+      if (localFile.path && window.desktopApp?.files?.preparePlayback) {
+        setUploadProgress(72)
+        setUploadLabel('正在准备本地播放环境')
+        preparedPlayback = await window.desktopApp.files.preparePlayback({
+          filePath: localFile.path,
+          originalName: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          sha256,
+        })
+      }
+
+      const duration = preparedPlayback?.duration ?? (await durationPromise)
       const nextDescriptor: MediaDescriptor = {
         id: sha256,
         name: file.name,
@@ -1783,19 +1832,26 @@ function App() {
         sha256,
       }
 
-      if (localMediaUrlRef.current) {
-        URL.revokeObjectURL(localMediaUrlRef.current)
-      }
+      releaseLocalMediaUrl(localMediaUrlRef.current)
 
-      const objectUrl = URL.createObjectURL(file)
-      localMediaUrlRef.current = objectUrl
-      setLocalMediaUrl(objectUrl)
+      const playbackUrl =
+        preparedPlayback?.playableUrl ?? URL.createObjectURL(file)
+      localMediaUrlRef.current = playbackUrl
+      setLocalMediaUrl(playbackUrl)
       setLocalMediaDescriptor(nextDescriptor)
       setUploadStatus('done')
       setUploadProgress(100)
       setUploadLabel(
-        isHost ? '片源指纹已发布，等待其他成员匹配同一文件' : '本地片源已提交校验',
+        preparedPlayback?.source === 'proxy'
+          ? '已准备本地兼容播放版本，等待同步播放'
+          : isHost
+            ? '片源指纹已发布，等待其他成员匹配同一文件'
+            : '本地片源已提交校验',
       )
+
+      if (preparedPlayback?.warning) {
+        setErrorMessage(preparedPlayback.warning)
+      }
 
       socket.emit('room:select-media', {
         roomId: currentRoom.roomId,
@@ -1809,47 +1865,32 @@ function App() {
   }
 
   const uploadSubtitle = async (file: File) => {
-    const socket = socketRef.current
-    const currentRoom = roomRef.current
-
-    if (!socket || !currentRoom) {
-      setErrorMessage('请先加入房间，再上传字幕')
-      return
-    }
-
     setSelectedSubtitleName(file.name)
-    setSubtitleStatus('uploading')
-    setSubtitleLabel('正在同步字幕文件')
+    setSubtitleLabel('正在载入本地字幕')
     setErrorMessage(null)
 
-    const formData = new FormData()
-    formData.append('subtitle', file)
-
     try {
-      const response = await fetch(
-        `${normalizeServerUrl(serverUrl)}/api/rooms/${currentRoom.roomId}/subtitle`,
-        {
-          method: 'POST',
-          headers: {
-            'x-socket-id': socket.id ?? '',
-          },
-          body: formData,
-        },
-      )
+      releaseLocalMediaUrl(localSubtitleUrlRef.current)
 
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | null
-        throw new Error(payload?.error ?? '字幕上传失败')
-      }
+      const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+      const nextFormat: 'vtt' | 'ass' =
+        extension === 'ass' || extension === 'ssa' ? 'ass' : 'vtt'
+      const objectUrl = URL.createObjectURL(file)
+
+      localSubtitleUrlRef.current = objectUrl
+      setLocalSubtitleUrl(objectUrl)
+      setLocalSubtitleFormat(nextFormat)
 
       setSubtitleStatus('done')
-      setSubtitleLabel('字幕已同步给所有人')
+      setSubtitleLabel('字幕仅在当前设备生效')
     } catch (error) {
       setSubtitleStatus('error')
-      setSubtitleLabel('字幕上传失败')
-      setErrorMessage(error instanceof Error ? error.message : '字幕上传失败')
+      setSubtitleLabel('字幕载入失败')
+      setSelectedSubtitleName('')
+      setLocalSubtitleUrl(null)
+      setLocalSubtitleFormat(null)
+      localSubtitleUrlRef.current = null
+      setErrorMessage(error instanceof Error ? error.message : '字幕载入失败')
     }
   }
 
@@ -2009,13 +2050,7 @@ function App() {
                       <p className="session-card__meta">
                         {session.mediaName ?? '房主还没有选片'}
                       </p>
-                      <p className="session-card__submeta">
-                        {session.subtitleName
-                          ? `字幕：${session.subtitleName}`
-                          : '当前没有字幕'}
-                      </p>
-
-                      <div className="session-card__actions">
+                          <div className="session-card__actions">
                         {session.requiresPassword ? (
                           <input
                             type="password"
@@ -2135,9 +2170,6 @@ function App() {
                 >
                   {getPreparationLabel(room, localBuffering, currentMember)}
                 </StatusPill>
-                <StatusPill tone={room?.subtitle ? 'accent' : 'neutral'}>
-                  {room?.subtitle ? '字幕已同步' : '暂无字幕'}
-                </StatusPill>
                 {room?.media ? (
                   <StatusPill
                     tone={
@@ -2174,7 +2206,7 @@ function App() {
                     <input
                       type="file"
                       accept={VIDEO_ACCEPT}
-                      disabled={isMediaUploading || isSubtitleUploading}
+                      disabled={isMediaUploading}
                       onChange={(event) => {
                         const nextFile = event.target.files?.[0]
 
@@ -2188,37 +2220,33 @@ function App() {
                     />
                   </label>
 
-                  {isHost ? (
-                    <label
-                      className={`segment__button segment__button--file ${
-                        subtitleStatus === 'done'
-                          ? 'segment__button--success'
-                          : subtitleStatus === 'error'
-                            ? 'segment__button--warning'
-                            : isSubtitleUploading
-                              ? 'segment__button--active'
-                              : ''
-                      }`}
-                    >
-                      <span className="segment__title">{subtitleButtonLabel}</span>
-                      <span className="segment__meta">{subtitleButtonMeta}</span>
-                      <input
-                        type="file"
-                        accept={SUBTITLE_ACCEPT}
-                        disabled={isMediaUploading || isSubtitleUploading}
-                        onChange={(event) => {
-                          const nextFile = event.target.files?.[0]
+                  <label
+                    className={`segment__button segment__button--file ${
+                      subtitleStatus === 'done'
+                        ? 'segment__button--success'
+                        : subtitleStatus === 'error'
+                          ? 'segment__button--warning'
+                          : ''
+                    }`}
+                  >
+                    <span className="segment__title">{subtitleButtonLabel}</span>
+                    <span className="segment__meta">{subtitleButtonMeta}</span>
+                    <input
+                      type="file"
+                      accept={SUBTITLE_ACCEPT}
+                      disabled={isMediaUploading}
+                      onChange={(event) => {
+                        const nextFile = event.target.files?.[0]
 
-                          if (!nextFile) {
-                            return
-                          }
+                        if (!nextFile) {
+                          return
+                        }
 
-                          void uploadSubtitle(nextFile)
-                          event.target.value = ''
-                        }}
-                      />
-                    </label>
-                  ) : null}
+                        void uploadSubtitle(nextFile)
+                        event.target.value = ''
+                      }}
+                    />
+                  </label>
                 </div>
 
                 <p className="support-note">{formatSupportHint(selectedFileName || room?.media?.name)}</p>
@@ -2315,9 +2343,9 @@ function App() {
                       <track
                         default
                         kind="subtitles"
-                        label={room?.subtitle?.name ?? '字幕'}
+                        label={selectedSubtitleName || '字幕'}
                         src={subtitleUrl}
-                        srcLang={room?.subtitle?.language ?? 'zh'}
+                        srcLang="zh"
                       />
                     ) : null}
                   </video>
@@ -2448,12 +2476,10 @@ function App() {
               </article>
 
               <article className="meta-card">
-                <span>当前字幕</span>
-                <strong>{room?.subtitle?.name ?? (selectedSubtitleName || '未上传')}</strong>
+                <span>本地字幕</span>
+                <strong>{selectedSubtitleName || '未选择'}</strong>
                 <p>
-                  {subtitleStatus === 'uploading'
-                    ? '正在同步字幕文件'
-                    : subtitleLabel}
+                  {subtitleLabel}
                 </p>
               </article>
 
