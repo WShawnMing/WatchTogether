@@ -130,6 +130,7 @@ export function registerIpcHandlers(win: BrowserWindow): void {
       sendToRenderer('room:update', {
         type: 'joined',
         roomId: roomServer.getRoomId(),
+        roomName,
         isHost: true
       })
       sendToRenderer('room:update', {
@@ -195,6 +196,7 @@ export function registerIpcHandlers(win: BrowserWindow): void {
       sendToRenderer('room:update', {
         type: 'joined',
         roomId: room.id,
+        roomName: room.name,
         isHost: false
       })
 

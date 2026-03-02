@@ -5,6 +5,7 @@ import type { RoomInfo, Member, PlayerStatus, ToastMessage, FileFingerprint, Pla
 interface RoomUpdate {
   type: 'joined' | 'left' | 'snapshot' | 'file_match' | 'closed' | 'member_joined' | 'member_left'
   roomId?: string
+  roomName?: string
   members?: Member[]
   member?: Member
   memberId?: string

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useCallback } from 'react'
 import { useRoomStore } from './stores/roomStore'
 import { usePlayerStore } from './stores/playerStore'
 import HomePage from './pages/HomePage'
@@ -11,6 +11,7 @@ export default function App() {
   const handleRoomUpdate = useRoomStore((s) => s.handleRoomUpdate)
   const setPlayerStatus = usePlayerStore((s) => s.setStatus)
   const addToast = usePlayerStore((s) => s.addToast)
+  const status = usePlayerStore((s) => s.status)
 
   useEffect(() => {
     const unsubs = [
@@ -22,6 +23,43 @@ export default function App() {
     window.api.refreshRooms()
     return () => unsubs.forEach((fn) => fn())
   }, [])
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (!currentRoom || !status.file) return
+      if (e.target instanceof HTMLInputElement) return
+
+      switch (e.key) {
+        case ' ':
+          e.preventDefault()
+          window.api.togglePause()
+          break
+        case 'ArrowLeft':
+          e.preventDefault()
+          window.api.seek(Math.max(0, status.position - 5))
+          break
+        case 'ArrowRight':
+          e.preventDefault()
+          window.api.seek(Math.min(status.duration, status.position + 5))
+          break
+        case 'j':
+          window.api.seek(Math.max(0, status.position - 10))
+          break
+        case 'l':
+          window.api.seek(Math.min(status.duration, status.position + 10))
+          break
+        case 'k':
+          window.api.togglePause()
+          break
+      }
+    },
+    [currentRoom, status.file, status.position, status.duration]
+  )
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handleKeyDown])
 
   return (
     <div className="h-screen flex flex-col bg-surface text-gray-100">

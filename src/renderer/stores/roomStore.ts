@@ -4,6 +4,7 @@ import type { RoomInfo, Member, FileFingerprint, PlaybackState } from '../../sha
 interface RoomUpdate {
   type: string
   roomId?: string
+  roomName?: string
   members?: Member[]
   member?: Member
   memberId?: string
@@ -55,12 +56,24 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   handleRoomUpdate: (data) => {
     const state = get()
     switch (data.type) {
-      case 'joined':
+      case 'joined': {
+        const existing = state.rooms.find((r) => r.id === data.roomId)
         set({
-          currentRoom: { ...state.currentRoom!, id: data.roomId! },
-          isHost: data.isHost ?? false
+          currentRoom: existing ?? {
+            id: data.roomId ?? '',
+            name: data.roomName ?? '我的房间',
+            hostIp: '',
+            hostNickname: state.nickname,
+            port: 0,
+            hasPassword: false,
+            memberCount: 1,
+            lastSeen: Date.now()
+          },
+          isHost: data.isHost ?? false,
+          fileMatched: false
         })
         break
+      }
       case 'snapshot':
         set({
           members: data.members ?? [],
