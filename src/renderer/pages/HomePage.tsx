@@ -14,23 +14,42 @@ export default function HomePage() {
   }
 
   return (
-    <div className="flex flex-col h-full p-6 gap-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-sm text-gray-400">
-            欢迎, <span className="text-white font-medium">{nickname}</span>
+    <div className="flex h-full">
+      {/* Sidebar */}
+      <div className="w-64 shrink-0 border-r border-black/[0.04] bg-bg-card flex flex-col">
+        <div className="px-4 pt-4 pb-3">
+          <p className="text-[12px] text-fg-tertiary">
+            {nickname}
           </p>
         </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="px-5 py-2 rounded-xl bg-accent hover:bg-accent-hover text-white text-sm font-medium transition-all shadow-lg shadow-accent/20"
-        >
-          开始共享
-        </button>
+
+        <div className="flex-1 overflow-y-auto px-3">
+          <RoomList />
+        </div>
+
+        <div className="p-3 border-t border-black/[0.04]">
+          <button
+            onClick={() => setShowCreate(true)}
+            className="w-full py-2.5 rounded-xl bg-accent text-white text-[13px] font-medium hover:bg-accent-hover transition-all"
+          >
+            开始共享
+          </button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
-        <RoomList />
+      {/* Main area */}
+      <div className="flex-1 flex items-center justify-center bg-bg">
+        <div className="text-center animate-fade-in">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-bg-secondary flex items-center justify-center">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#aeaeb2" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+              <line x1="12" y1="17" x2="12" y2="21" />
+            </svg>
+          </div>
+          <p className="text-[15px] font-medium text-fg">创建或加入房间</p>
+          <p className="text-[13px] text-fg-tertiary mt-1">在左侧选择一个房间，或创建新房间开始观影</p>
+        </div>
       </div>
 
       {showCreate && <CreateRoomDialog onClose={() => setShowCreate(false)} />}

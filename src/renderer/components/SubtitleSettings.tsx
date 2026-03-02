@@ -9,13 +9,8 @@ export default function SubtitleSettings() {
   const setSubtitlePosition = usePlayerStore((s) => s.setSubtitlePosition)
   const status = usePlayerStore((s) => s.status)
 
-  const handleSelectSubtitle = async () => {
-    await window.api.selectSubtitleFile()
-  }
-
-  const handleRemoveSubtitle = async () => {
-    await window.api.removeSubtitle()
-  }
+  const handleSelectSubtitle = () => window.api.selectSubtitleFile()
+  const handleRemoveSubtitle = () => window.api.removeSubtitle()
 
   const handleSizeChange = (size: number) => {
     setSubtitleSize(size)
@@ -28,56 +23,71 @@ export default function SubtitleSettings() {
   }
 
   return (
-    <div className="flex flex-col gap-2">
+    <div>
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center justify-between text-sm font-medium text-gray-300 hover:text-white transition-colors"
+        className="flex items-center gap-1.5 text-[12px] text-fg-secondary hover:text-fg transition-colors"
       >
-        <span>字幕设置</span>
-        <span className="text-xs text-gray-500">{expanded ? '▼' : '▶'}</span>
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 10 10"
+          fill="currentColor"
+          className={`transition-transform ${expanded ? 'rotate-90' : ''}`}
+        >
+          <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        字幕
+        {status.subtitleFile && (
+          <span className="text-[11px] text-fg-tertiary ml-1 truncate max-w-[120px]">
+            · {status.subtitleFile.split('/').pop()?.split('\\').pop()}
+          </span>
+        )}
       </button>
 
       {expanded && (
-        <div className="flex flex-col gap-3 pl-1">
+        <div className="mt-3 flex flex-col gap-3 pl-4 animate-fade-in">
           <div className="flex items-center gap-2">
             <button
               onClick={handleSelectSubtitle}
-              className="text-xs px-3 py-1 rounded-lg bg-accent/20 text-accent hover:bg-accent/30 transition-all"
+              className="text-[12px] text-accent hover:text-accent-hover transition-colors"
             >
-              选择字幕
+              选择字幕文件
             </button>
             {status.subtitleFile && (
               <button
                 onClick={handleRemoveSubtitle}
-                className="text-xs px-2 py-1 rounded-lg bg-white/5 text-gray-400 hover:bg-white/10 transition-all"
+                className="text-[12px] text-fg-tertiary hover:text-fg-secondary transition-colors"
               >
                 移除
               </button>
             )}
           </div>
 
-          <label className="flex flex-col gap-1">
-            <span className="text-xs text-gray-500">字号 ({subtitleSize})</span>
+          <label className="flex items-center gap-3">
+            <span className="text-[12px] text-fg-tertiary w-8 shrink-0">字号</span>
             <input
               type="range"
               min={24}
               max={72}
               value={subtitleSize}
               onChange={(e) => handleSizeChange(Number(e.target.value))}
-              className="w-full accent-accent"
+              className="flex-1 h-1 accent-accent"
             />
+            <span className="text-[11px] text-fg-tertiary w-6 text-right">{subtitleSize}</span>
           </label>
 
-          <label className="flex flex-col gap-1">
-            <span className="text-xs text-gray-500">位置 ({subtitlePosition})</span>
+          <label className="flex items-center gap-3">
+            <span className="text-[12px] text-fg-tertiary w-8 shrink-0">位置</span>
             <input
               type="range"
               min={50}
               max={100}
               value={subtitlePosition}
               onChange={(e) => handlePositionChange(Number(e.target.value))}
-              className="w-full accent-accent"
+              className="flex-1 h-1 accent-accent"
             />
+            <span className="text-[11px] text-fg-tertiary w-6 text-right">{subtitlePosition}</span>
           </label>
         </div>
       )}

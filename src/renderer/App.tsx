@@ -62,14 +62,23 @@ export default function App() {
   }, [handleKeyDown])
 
   return (
-    <div className="h-screen flex flex-col bg-surface text-gray-100">
-      <div className="flex items-center h-10 draggable-region px-4 bg-surface-light/50 border-b border-white/5"
-           style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
-        <span className="text-sm font-semibold tracking-wide text-accent">WatchTogether</span>
+    <div className="h-screen flex flex-col bg-bg">
+      {/* Title bar / drag region */}
+      <div
+        className="flex items-center justify-between h-11 px-5 bg-bg-card border-b border-black/[0.04] shrink-0"
+        style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+      >
+        <span className="text-[13px] font-semibold text-fg tracking-tight">WatchTogether</span>
+        {currentRoom && (
+          <span className="text-2xs text-fg-tertiary">{currentRoom.name}</span>
+        )}
       </div>
+
+      {/* Main content */}
       <div className="flex-1 overflow-hidden">
         {currentRoom ? <RoomPage /> : <HomePage />}
       </div>
+
       <Toast />
     </div>
   )

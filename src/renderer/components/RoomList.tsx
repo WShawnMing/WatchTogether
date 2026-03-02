@@ -32,72 +32,66 @@ export default function RoomList() {
   }
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-white">附近房间</h2>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="text-[13px] font-medium text-fg-secondary">附近房间</h3>
         <button
           onClick={handleRefresh}
-          className="text-xs text-accent hover:text-accent-hover transition-colors px-3 py-1 rounded-lg hover:bg-white/5"
+          className="text-[12px] text-accent hover:text-accent-hover transition-colors"
         >
           刷新
         </button>
       </div>
 
       {rooms.length === 0 ? (
-        <div className="text-center py-12 text-gray-500 text-sm">
-          <p>暂无发现房间</p>
-          <p className="mt-1 text-xs text-gray-600">请确保双方在同一局域网内</p>
+        <div className="py-8 text-center">
+          <p className="text-[13px] text-fg-tertiary">暂无房间</p>
+          <p className="text-[11px] text-fg-tertiary mt-1">确保双方在同一网络内</p>
         </div>
       ) : (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-1.5">
           {rooms.map((room) => (
             <div
               key={room.id}
-              className="flex items-center justify-between px-4 py-3 rounded-xl bg-surface-light/60 border border-white/5 hover:border-accent/30 transition-all"
+              className="group flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-bg-secondary/80 transition-colors"
             >
-              <div>
-                <div className="text-sm font-medium text-white flex items-center gap-2">
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium text-fg truncate flex items-center gap-1.5">
                   {room.name}
                   {room.hasPassword && (
-                    <span className="text-[10px] text-gray-400 bg-white/5 px-1.5 py-0.5 rounded">🔒</span>
+                    <span className="text-[10px] text-fg-tertiary">🔒</span>
                   )}
                 </div>
-                <div className="text-xs text-gray-500 mt-0.5">
-                  {room.hostNickname} · {room.memberCount} 人
+                <div className="text-[11px] text-fg-tertiary mt-0.5">
+                  {room.hostNickname} · {room.memberCount}人
                 </div>
               </div>
 
               {passwordRoomId === room.id ? (
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 ml-2 shrink-0">
                   <input
                     type="password"
                     value={passwordInput}
                     onChange={(e) => setPasswordInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && doJoin(room.id, passwordInput)}
                     placeholder="密码"
-                    className="w-24 px-2 py-1 rounded-lg bg-surface border border-white/10 text-white text-xs focus:outline-none focus:border-accent"
+                    className="w-20 px-2 py-1 rounded-lg bg-bg border border-black/[0.06] text-[12px] text-fg focus:border-accent/40 transition-colors"
                     autoFocus
                   />
                   <button
                     onClick={() => doJoin(room.id, passwordInput)}
-                    className="text-xs text-accent hover:text-accent-hover px-2 py-1"
+                    className="text-[12px] text-accent"
                   >
-                    确定
-                  </button>
-                  <button
-                    onClick={() => setPasswordRoomId(null)}
-                    className="text-xs text-gray-500 hover:text-gray-300 px-1 py-1"
-                  >
-                    取消
+                    加入
                   </button>
                 </div>
               ) : (
                 <button
                   onClick={() => handleJoin(room)}
                   disabled={joiningId === room.id}
-                  className="text-xs px-4 py-1.5 rounded-lg bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-50 transition-all"
+                  className="text-[12px] text-accent opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50 ml-2 shrink-0"
                 >
-                  {joiningId === room.id ? '加入中...' : '加入'}
+                  {joiningId === room.id ? '加入中' : '加入'}
                 </button>
               )}
             </div>

@@ -13,59 +13,93 @@ export default function PlaybackStatus() {
 
   if (!status.file) {
     return (
-      <div className="text-center py-6 text-gray-500 text-sm">
-        请选择视频文件开始观看
+      <div className="flex items-center justify-center py-16">
+        <p className="text-[14px] text-fg-tertiary">选择视频文件开始观看</p>
       </div>
     )
   }
 
   const progress = status.duration > 0 ? (status.position / status.duration) * 100 : 0
 
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (status.duration <= 0) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    window.api.seek(ratio * status.duration)
+  }
+
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between text-xs text-gray-400">
-        <span>{formatTime(status.position)}</span>
-        <span className={`px-2 py-0.5 rounded ${status.paused ? 'bg-yellow-500/20 text-yellow-300' : 'bg-green-500/20 text-green-300'}`}>
-          {status.paused ? '已暂停' : '播放中'}
-        </span>
-        <span>{formatTime(status.duration)}</span>
-      </div>
-
-      <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+    <div className="flex flex-col gap-4 animate-fade-in">
+      {/* Progress bar */}
+      <div className="flex flex-col gap-2">
         <div
-          className="h-full bg-accent rounded-full transition-all duration-300"
-          style={{ width: `${progress}%` }}
-        />
+          className="w-full h-1 bg-black/[0.06] rounded-full cursor-pointer group relative"
+          onClick={handleSeek}
+        >
+          <div
+            className="h-full bg-accent rounded-full transition-all duration-150 relative"
+            style={{ width: `${progress}%` }}
+          >
+            <div className="absolute right-0 top-1/2 -translate-y-1/2 w-2.5 h-2.5 bg-accent rounded-full opacity-0 group-hover:opacity-100 transition-opacity shadow-sm" />
+          </div>
+        </div>
+        <div className="flex justify-between text-[11px] text-fg-tertiary">
+          <span>{formatTime(status.position)}</span>
+          <span>{formatTime(status.duration)}</span>
+        </div>
       </div>
 
-      <div className="flex items-center justify-center gap-3">
+      {/* Controls */}
+      <div className="flex items-center justify-center gap-5">
         <button
           onClick={() => window.api.seek(Math.max(0, status.position - 10))}
-          className="p-2 rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-all text-sm"
-          title="后退 10 秒"
+          className="w-8 h-8 flex items-center justify-center rounded-full text-fg-secondary hover:text-fg hover:bg-bg-secondary transition-all"
+          title="后退 10s"
         >
-          ⏪
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="11 17 6 12 11 7" />
+            <polyline points="18 17 13 12 18 7" />
+          </svg>
         </button>
+
         <button
           onClick={() => window.api.togglePause()}
-          className="p-3 rounded-xl bg-accent/20 hover:bg-accent/30 text-accent text-lg transition-all"
+          className="w-10 h-10 flex items-center justify-center rounded-full bg-fg text-bg-card hover:bg-fg/90 transition-all"
         >
-          {status.paused ? '▶' : '⏸'}
+          {status.paused ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="4" width="4" height="16" rx="1" />
+              <rect x="14" y="4" width="4" height="16" rx="1" />
+            </svg>
+          )}
         </button>
+
         <button
           onClick={() => window.api.seek(Math.min(status.duration, status.position + 10))}
-          className="p-2 rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-all text-sm"
-          title="快进 10 秒"
+          className="w-8 h-8 flex items-center justify-center rounded-full text-fg-secondary hover:text-fg hover:bg-bg-secondary transition-all"
+          title="快进 10s"
         >
-          ⏩
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="13 17 18 12 13 7" />
+            <polyline points="6 17 11 12 6 7" />
+          </svg>
         </button>
       </div>
 
-      {status.subtitleFile && (
-        <div className="text-[11px] text-gray-500 text-center truncate">
-          字幕: {status.subtitleFile.split('/').pop()?.split('\\').pop()}
-        </div>
-      )}
+      {/* State pill */}
+      <div className="flex justify-center">
+        <span className={`text-[11px] px-2.5 py-0.5 rounded-full ${
+          status.paused
+            ? 'bg-bg-secondary text-fg-secondary'
+            : 'bg-ok-light text-ok'
+        }`}>
+          {status.paused ? '已暂停' : '播放中'}
+        </span>
+      </div>
     </div>
   )
 }
