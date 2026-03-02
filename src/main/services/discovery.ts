@@ -167,8 +167,6 @@ export class DiscoveryService extends EventEmitter {
       for (const addr of addrs) {
         if (addr.family !== 'IPv4' || addr.internal) continue
 
-        const prefix = this.maskBits(addr.netmask)
-
         // 1. Standard subnet broadcast
         const broadcast = this.calcBroadcast(addr.address, addr.netmask)
         if (!sent.has(broadcast)) {
@@ -176,19 +174,18 @@ export class DiscoveryService extends EventEmitter {
           try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, broadcast) } catch {}
         }
 
-        // 2. For /24 or narrower subnets (VPN networks are typically /24, /31, /32),
-        //    unicast to every host in the /24 block. 254 small UDP packets is negligible.
-        if (prefix >= 24) {
-          const parts = addr.address.split('.').map(Number)
-          const self = parts[3]
-          const base = `${parts[0]}.${parts[1]}.${parts[2]}`
-          for (let i = 1; i < 255; i++) {
-            if (i === self) continue
-            const target = `${base}.${i}`
-            if (!sent.has(target)) {
-              sent.add(target)
-              try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, target) } catch {}
-            }
+        // 2. Always unicast scan the /24 block around our IP.
+        //    VPN networks (蒲公英/Tailscale/ZeroTier) often have /16 or /32 masks
+        //    where broadcast doesn't work. 254 small UDP packets is negligible.
+        const parts = addr.address.split('.').map(Number)
+        const self = parts[3]
+        const base = `${parts[0]}.${parts[1]}.${parts[2]}`
+        for (let i = 1; i < 255; i++) {
+          if (i === self) continue
+          const target = `${base}.${i}`
+          if (!sent.has(target)) {
+            sent.add(target)
+            try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, target) } catch {}
           }
         }
       }
@@ -220,11 +217,4 @@ export class DiscoveryService extends EventEmitter {
     return ipParts.map((p, i) => (p | (~maskParts[i] & 255))).join('.')
   }
 
-  private maskBits(mask: string): number {
-    return mask.split('.').reduce((bits, octet) => {
-      let n = parseInt(octet)
-      while (n) { bits += n & 1; n >>= 1 }
-      return bits
-    }, 0)
-  }
 }
