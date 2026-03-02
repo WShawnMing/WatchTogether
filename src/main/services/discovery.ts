@@ -10,6 +10,8 @@ import {
 import type { DiscoveryAnnounce, DiscoveryProbe, DiscoveryGone } from '../../shared/protocol'
 import type { RoomInfo } from '../../shared/types'
 
+const MULTICAST_GROUP = '239.255.42.42'
+
 export class DiscoveryService extends EventEmitter {
   private socket: dgram.Socket | null = null
   private announceTimer: NodeJS.Timer | null = null
@@ -33,6 +35,7 @@ export class DiscoveryService extends EventEmitter {
     await new Promise<void>((resolve, reject) => {
       this.socket!.bind(DISCOVERY_PORT, () => {
         this.socket!.setBroadcast(true)
+        this.joinMulticast()
         resolve()
       })
       this.socket!.on('error', reject)
@@ -43,8 +46,8 @@ export class DiscoveryService extends EventEmitter {
 
   startAnnouncing(announce: DiscoveryAnnounce): void {
     this.announcing = announce
-    this.broadcastAnnounce()
-    this.announceTimer = setInterval(() => this.broadcastAnnounce(), DISCOVERY_INTERVAL_MS)
+    this.sendAll()
+    this.announceTimer = setInterval(() => this.sendAll(), DISCOVERY_INTERVAL_MS)
   }
 
   stopAnnouncing(): void {
@@ -56,7 +59,7 @@ export class DiscoveryService extends EventEmitter {
       }
       const buf = Buffer.from(JSON.stringify(gone))
       for (let i = 0; i < 3; i++) {
-        setTimeout(() => this.broadcastToAll(buf), i * 200)
+        setTimeout(() => this.sendEverywhere(buf), i * 200)
       }
     }
     if (this.announceTimer) {
@@ -67,15 +70,13 @@ export class DiscoveryService extends EventEmitter {
   }
 
   triggerProbe(): void {
-    const msg = JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe)
-    const buf = Buffer.from(msg)
-    this.broadcastToAll(buf)
+    const buf = Buffer.from(JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe))
+    this.sendEverywhere(buf)
   }
 
   probeIp(ip: string): void {
     if (!this.socket) return
-    const msg = JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe)
-    const buf = Buffer.from(msg)
+    const buf = Buffer.from(JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe))
     try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, ip) } catch {}
   }
 
@@ -97,10 +98,31 @@ export class DiscoveryService extends EventEmitter {
       this.cleanupTimer = null
     }
     if (this.socket) {
+      try { this.socket.dropMembership(MULTICAST_GROUP) } catch {}
       this.socket.close()
       this.socket = null
     }
     this.rooms.clear()
+  }
+
+  private joinMulticast(): void {
+    if (!this.socket) return
+
+    // Join on default interface
+    try { this.socket.addMembership(MULTICAST_GROUP) } catch {}
+
+    // Also join on each specific IPv4 interface for VPN adapters
+    const interfaces = os.networkInterfaces()
+    for (const addrs of Object.values(interfaces)) {
+      if (!addrs) continue
+      for (const addr of addrs) {
+        if (addr.family !== 'IPv4' || addr.internal) continue
+        try { this.socket.addMembership(MULTICAST_GROUP, addr.address) } catch {}
+      }
+    }
+
+    try { this.socket.setMulticastTTL(128) } catch {}
+    try { this.socket.setMulticastLoopback(true) } catch {}
   }
 
   private handleMessage(raw: Buffer, rinfo: dgram.RemoteInfo): void {
@@ -112,9 +134,11 @@ export class DiscoveryService extends EventEmitter {
         this.handleAnnounce(data as DiscoveryAnnounce, rinfo.address)
       } else if (data.action === 'probe') {
         if (this.announcing) {
-          // Unicast reply directly to the prober — works across VPN
           const buf = Buffer.from(JSON.stringify(this.announcing))
+          // Reply via unicast directly to the prober
           try { this.socket?.send(buf, 0, buf.length, DISCOVERY_PORT, rinfo.address) } catch {}
+          // Also reply via multicast so others can see
+          try { this.socket?.send(buf, 0, buf.length, DISCOVERY_PORT, MULTICAST_GROUP) } catch {}
         }
       } else if (data.action === 'gone') {
         this.handleGone(data as DiscoveryGone)
@@ -137,9 +161,7 @@ export class DiscoveryService extends EventEmitter {
     const isNew = !this.rooms.has(room.id)
     this.rooms.set(room.id, room)
 
-    if (isNew) {
-      this.emit('room-found', room)
-    }
+    if (isNew) this.emit('room-found', room)
     this.emit('rooms-updated', this.getRooms())
   }
 
@@ -150,33 +172,41 @@ export class DiscoveryService extends EventEmitter {
     }
   }
 
-  private broadcastAnnounce(): void {
+  private sendAll(): void {
     if (!this.announcing || !this.socket) return
     const buf = Buffer.from(JSON.stringify(this.announcing))
-    this.broadcastToAll(buf)
+    this.sendEverywhere(buf)
   }
 
-  private broadcastToAll(buf: Buffer): void {
+  /**
+   * Send a buffer via every possible channel:
+   * 1. Multicast group (works across VPN regardless of subnet)
+   * 2. Subnet broadcast per interface (works on normal LAN)
+   * 3. Unicast scan of /24 block per interface (fallback for blocked multicast)
+   * 4. Global broadcast 255.255.255.255
+   */
+  private sendEverywhere(buf: Buffer): void {
     if (!this.socket) return
 
-    const interfaces = os.networkInterfaces()
     const sent = new Set<string>()
 
+    // 1. Multicast — the primary method for VPN networks
+    try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, MULTICAST_GROUP) } catch {}
+
+    const interfaces = os.networkInterfaces()
     for (const addrs of Object.values(interfaces)) {
       if (!addrs) continue
       for (const addr of addrs) {
         if (addr.family !== 'IPv4' || addr.internal) continue
 
-        // 1. Standard subnet broadcast
+        // 2. Subnet broadcast
         const broadcast = this.calcBroadcast(addr.address, addr.netmask)
         if (!sent.has(broadcast)) {
           sent.add(broadcast)
           try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, broadcast) } catch {}
         }
 
-        // 2. Always unicast scan the /24 block around our IP.
-        //    VPN networks (蒲公英/Tailscale/ZeroTier) often have /16 or /32 masks
-        //    where broadcast doesn't work. 254 small UDP packets is negligible.
+        // 3. Unicast scan /24 around our IP
         const parts = addr.address.split('.').map(Number)
         const self = parts[3]
         const base = `${parts[0]}.${parts[1]}.${parts[2]}`
@@ -191,7 +221,7 @@ export class DiscoveryService extends EventEmitter {
       }
     }
 
-    // Global broadcast fallback
+    // 4. Global broadcast
     if (!sent.has('255.255.255.255')) {
       try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, '255.255.255.255') } catch {}
     }
@@ -206,9 +236,7 @@ export class DiscoveryService extends EventEmitter {
         changed = true
       }
     }
-    if (changed) {
-      this.emit('rooms-updated', this.getRooms())
-    }
+    if (changed) this.emit('rooms-updated', this.getRooms())
   }
 
   private calcBroadcast(ip: string, mask: string): string {
@@ -216,5 +244,4 @@ export class DiscoveryService extends EventEmitter {
     const maskParts = mask.split('.').map(Number)
     return ipParts.map((p, i) => (p | (~maskParts[i] & 255))).join('.')
   }
-
 }
