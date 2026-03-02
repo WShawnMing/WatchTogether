@@ -200,6 +200,20 @@ export class DiscoveryService extends EventEmitter {
     }
   }
 
+  private cleanStaleRooms(): void {
+    const now = Date.now()
+    let changed = false
+    for (const [id, room] of this.rooms) {
+      if (now - room.lastSeen > ROOM_STALE_MS) {
+        this.rooms.delete(id)
+        changed = true
+      }
+    }
+    if (changed) {
+      this.emit('rooms-updated', this.getRooms())
+    }
+  }
+
   private calcBroadcast(ip: string, mask: string): string {
     const ipParts = ip.split('.').map(Number)
     const maskParts = mask.split('.').map(Number)
