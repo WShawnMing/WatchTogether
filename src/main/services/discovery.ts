@@ -206,16 +206,29 @@ export class DiscoveryService extends EventEmitter {
           try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, broadcast) } catch {}
         }
 
-        // 3. Unicast scan /24 around our IP
+        // 3. Unicast scan: our /24 + adjacent /24 blocks within the subnet.
+        //    For VPN /16 networks (e.g. 172.16.0.0/16), two peers may be
+        //    in different /24 blocks (172.16.0.x vs 172.16.1.x).
+        //    Scanning ±16 /24 blocks covers 33 × 254 ≈ 8400 packets — fine.
         const parts = addr.address.split('.').map(Number)
-        const self = parts[3]
-        const base = `${parts[0]}.${parts[1]}.${parts[2]}`
-        for (let i = 1; i < 255; i++) {
-          if (i === self) continue
-          const target = `${base}.${i}`
-          if (!sent.has(target)) {
-            sent.add(target)
-            try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, target) } catch {}
+        const maskParts = addr.netmask.split('.').map(Number)
+        const thirdOctet = parts[2]
+        const thirdMask = maskParts[2]
+        // How many /24 blocks to scan: if third octet mask is 0 (i.e. /16 or wider),
+        // scan ±16 blocks. If mask is 255 (/24), just scan our own block.
+        const range = thirdMask === 255 ? 0 : 16
+        const minBlock = Math.max(0, thirdOctet - range)
+        const maxBlock = Math.min(255, thirdOctet + range)
+
+        for (let block = minBlock; block <= maxBlock; block++) {
+          const base = `${parts[0]}.${parts[1]}.${block}`
+          for (let i = 1; i < 255; i++) {
+            if (block === thirdOctet && i === parts[3]) continue
+            const target = `${base}.${i}`
+            if (!sent.has(target)) {
+              sent.add(target)
+              try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, target) } catch {}
+            }
           }
         }
       }
