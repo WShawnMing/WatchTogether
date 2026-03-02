@@ -1,12 +1,14 @@
 import { useRoomStore } from '../stores/roomStore'
+import { usePlayerStore } from '../stores/playerStore'
 import MemberList from '../components/MemberList'
 import FileSelector from '../components/FileSelector'
 import FileMatchStatus from '../components/FileMatchStatus'
-import PlaybackStatus from '../components/PlaybackStatus'
 import SubtitleSettings from '../components/SubtitleSettings'
+import VideoPlayer from '../components/VideoPlayer'
 
 export default function RoomPage() {
   const isHost = useRoomStore((s) => s.isHost)
+  const mediaUrl = usePlayerStore((s) => s.mediaUrl)
 
   const handleLeave = async () => {
     await window.api.leaveRoom()
@@ -33,7 +35,6 @@ export default function RoomPage() {
           <MemberList />
         </div>
 
-        {/* Sidebar bottom: file & subtitle */}
         <div className="border-t border-black/[0.04] px-4 py-3 flex flex-col gap-3">
           <FileSelector />
           <FileMatchStatus />
@@ -41,13 +42,32 @@ export default function RoomPage() {
         </div>
       </div>
 
-      {/* Main: Player area */}
-      <div className="flex-1 flex flex-col bg-bg">
-        <div className="flex-1 flex items-center justify-center p-8">
-          <div className="w-full max-w-xl">
-            <PlaybackStatus />
+      {/* Main: Player */}
+      <div className="flex-1 flex flex-col bg-bg overflow-hidden">
+        {mediaUrl ? (
+          <div className="flex-1 flex items-center justify-center p-6">
+            <div className="w-full max-w-4xl">
+              <VideoPlayer />
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center animate-fade-in">
+              <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-bg-secondary flex items-center justify-center">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#aeaeb2" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+              </div>
+              <p className="text-[14px] text-fg-secondary">选择视频文件开始观看</p>
+              <button
+                onClick={() => window.api.selectVideoFile()}
+                className="mt-4 px-5 py-2 rounded-xl bg-accent text-white text-[13px] font-medium hover:bg-accent-hover transition-all"
+              >
+                选择文件
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -3,11 +3,16 @@ import type { PlayerStatus, ToastMessage } from '../../shared/types'
 
 interface PlayerState {
   status: PlayerStatus
+  mediaUrl: string | null
+  subtitleUrl: string | null
+  filePath: string | null
   toasts: ToastMessage[]
   subtitleSize: number
   subtitlePosition: number
 
   setStatus: (s: PlayerStatus) => void
+  setMedia: (url: string | null, path?: string | null) => void
+  setSubtitle: (url: string | null) => void
   addToast: (t: ToastMessage) => void
   removeToast: (id: string) => void
   setSubtitleSize: (n: number) => void
@@ -27,11 +32,23 @@ const defaultStatus: PlayerStatus = {
 
 export const usePlayerStore = create<PlayerState>((set) => ({
   status: { ...defaultStatus },
+  mediaUrl: null,
+  subtitleUrl: null,
+  filePath: null,
   toasts: [],
   subtitleSize: 48,
   subtitlePosition: 100,
 
   setStatus: (status) => set({ status }),
+
+  setMedia: (mediaUrl, filePath) =>
+    set({
+      mediaUrl,
+      filePath: filePath ?? null,
+      subtitleUrl: null
+    }),
+
+  setSubtitle: (subtitleUrl) => set({ subtitleUrl }),
 
   addToast: (toast) =>
     set((state) => ({
@@ -46,5 +63,12 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   setSubtitleSize: (subtitleSize) => set({ subtitleSize }),
   setSubtitlePosition: (subtitlePosition) => set({ subtitlePosition }),
 
-  reset: () => set({ status: { ...defaultStatus }, toasts: [] })
+  reset: () =>
+    set({
+      status: { ...defaultStatus },
+      mediaUrl: null,
+      subtitleUrl: null,
+      filePath: null,
+      toasts: []
+    })
 }))

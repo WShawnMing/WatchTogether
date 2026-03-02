@@ -1,6 +1,6 @@
 import { ipcMain, dialog, BrowserWindow } from 'electron'
 import { v4 as uuid } from 'uuid'
-import { MpvPlayer } from '../services/mpv-player'
+import { MediaServer } from '../services/media-server'
 import { DiscoveryService } from '../services/discovery'
 import { RoomServer } from '../services/room-server'
 import { RoomClient } from '../services/room-client'
@@ -11,7 +11,7 @@ import type { DiscoveryAnnounce } from '../../shared/protocol'
 import type { FileFingerprint, ToastMessage } from '../../shared/types'
 
 let mainWindow: BrowserWindow
-let mpvPlayer: MpvPlayer | null = null
+let mediaServer: MediaServer | null = null
 let discovery: DiscoveryService | null = null
 let roomServer: RoomServer | null = null
 let roomClient: RoomClient | null = null
@@ -21,49 +21,37 @@ let nickname = ''
 const memberId = uuid()
 let currentFingerprint: FileFingerprint | null = null
 
-function sendToRenderer(channel: string, data: unknown): void {
+function send(channel: string, data: unknown): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, data)
   }
 }
 
 function toast(text: string, type: ToastMessage['type'] = 'info'): void {
-  sendToRenderer('app:toast', { id: uuid(), text, type, duration: 3000 })
+  send('app:toast', { id: uuid(), text, type, duration: 3000 })
 }
 
-async function initMpv(): Promise<void> {
-  if (mpvPlayer) return
-  mpvPlayer = new MpvPlayer()
-  try {
-    await mpvPlayer.initialize()
-    mpvPlayer.on('state-change', async () => {
-      if (mpvPlayer) {
-        const status = await mpvPlayer.getStatus()
-        sendToRenderer('player:state', status)
-      }
-    })
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err)
-    mpvPlayer = null
-    toast(message, 'error')
-    throw err
-  }
+function sendPlayerCommand(cmd: unknown): void {
+  send('player:command', cmd)
 }
 
-async function initDiscovery(): Promise<void> {
+async function ensureMediaServer(): Promise<void> {
+  if (mediaServer) return
+  mediaServer = new MediaServer()
+  await mediaServer.start()
+}
+
+async function ensureDiscovery(): Promise<void> {
   if (discovery) return
   discovery = new DiscoveryService()
   await discovery.start()
-  discovery.on('rooms-updated', (rooms) => {
-    sendToRenderer('room:list', rooms)
-  })
+  discovery.on('rooms-updated', (rooms) => send('room:list', rooms))
 }
 
-function setupSyncEngine(): void {
-  if (!mpvPlayer) return
+function setupSync(): void {
   syncEngine?.destroy()
-
-  syncEngine = new SyncEngine(mpvPlayer, {
+  syncEngine = new SyncEngine({
+    sendCommand: sendPlayerCommand,
     server: roomServer ?? undefined,
     client: roomClient ?? undefined,
     isHost: !!roomServer
@@ -80,15 +68,15 @@ export function registerIpcHandlers(win: BrowserWindow): void {
 
   // ── Room ──
   ipcMain.handle('room:refresh', async () => {
-    await initDiscovery()
+    await ensureDiscovery()
     discovery!.triggerProbe()
-    sendToRenderer('room:list', discovery!.getRooms())
+    send('room:list', discovery!.getRooms())
   })
 
   ipcMain.handle('room:create', async (_e, roomName: string, password?: string) => {
     try {
-      await initDiscovery()
-      await initMpv()
+      await ensureDiscovery()
+      await ensureMediaServer()
 
       roomServer = new RoomServer(roomName, memberId, nickname, password)
       const port = await roomServer.start()
@@ -106,225 +94,174 @@ export function registerIpcHandlers(win: BrowserWindow): void {
       discovery!.startAnnouncing(announce)
 
       roomServer.on('member-joined', (member) => {
-        sendToRenderer('room:update', { type: 'member_joined', member })
-        toast(`${member.nickname} 加入了房间`, 'info')
+        send('room:update', { type: 'member_joined', member })
+        toast(`${member.nickname} 加入了房间`)
         announce.memberCount = roomServer!.getMemberCount()
       })
 
       roomServer.on('member-left', (member) => {
-        sendToRenderer('room:update', {
-          type: 'member_left',
-          memberId: member.id,
-          nickname: member.nickname
-        })
-        toast(`${member.nickname} 离开了房间`, 'info')
+        send('room:update', { type: 'member_left', memberId: member.id, nickname: member.nickname })
+        toast(`${member.nickname} 离开了房间`)
         announce.memberCount = roomServer!.getMemberCount()
       })
 
-      roomServer.on('remote-playback', (state) => {
-        // SyncEngine handles this
-      })
+      setupSync()
 
-      setupSyncEngine()
-
-      sendToRenderer('room:update', {
-        type: 'joined',
-        roomId: roomServer.getRoomId(),
-        roomName,
-        isHost: true
-      })
-      sendToRenderer('room:update', {
-        type: 'snapshot',
-        members: roomServer.getMembers()
-      })
-
+      send('room:update', { type: 'joined', roomId: roomServer.getRoomId(), roomName, isHost: true })
+      send('room:update', { type: 'snapshot', members: roomServer.getMembers() })
       return { success: true }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      return { success: false, error: message }
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
 
   ipcMain.handle('room:join', async (_e, roomId: string, _nick: string, password?: string) => {
     try {
-      await initDiscovery()
-      await initMpv()
+      await ensureDiscovery()
+      await ensureMediaServer()
 
-      const rooms = discovery!.getRooms()
-      const room = rooms.find((r) => r.id === roomId)
+      const room = discovery!.getRooms().find((r) => r.id === roomId)
       if (!room) return { success: false, error: '房间未找到' }
 
       roomClient = new RoomClient(room.hostIp, room.port, nickname, memberId, password)
       await roomClient.connect()
 
       roomClient.on('snapshot', (data) => {
-        sendToRenderer('room:update', {
+        send('room:update', {
           type: 'snapshot',
           members: data.members,
           playbackState: data.playbackState,
           hostFingerprint: data.hostFingerprint
         })
       })
-
       roomClient.on('member-joined', (member) => {
-        sendToRenderer('room:update', { type: 'member_joined', member })
-        toast(`${member.nickname} 加入了房间`, 'info')
+        send('room:update', { type: 'member_joined', member })
+        toast(`${member.nickname} 加入了房间`)
       })
-
       roomClient.on('member-left', ({ memberId: mid, nickname: nick }) => {
-        sendToRenderer('room:update', { type: 'member_left', memberId: mid, nickname: nick })
-        toast(`${nick} 离开了房间`, 'info')
+        send('room:update', { type: 'member_left', memberId: mid, nickname: nick })
+        toast(`${nick} 离开了房间`)
       })
-
       roomClient.on('file-match', ({ matched }) => {
-        sendToRenderer('room:update', { type: 'file_match', matched })
+        send('room:update', { type: 'file_match', matched })
         toast(matched ? '片源匹配成功' : '片源不一致，请重新选择', matched ? 'success' : 'warning')
       })
-
       roomClient.on('room-closed', (reason: string) => {
-        sendToRenderer('room:update', { type: 'closed', reason })
+        send('room:update', { type: 'closed', reason })
         toast(reason, 'warning')
         cleanupRoom()
       })
 
-      roomClient.on('remote-playback', () => {
-        // SyncEngine handles this
-      })
+      setupSync()
 
-      setupSyncEngine()
-
-      sendToRenderer('room:update', {
-        type: 'joined',
-        roomId: room.id,
-        roomName: room.name,
-        isHost: false
-      })
-
+      send('room:update', { type: 'joined', roomId: room.id, roomName: room.name, isHost: false })
       return { success: true }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      return { success: false, error: message }
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
 
   ipcMain.handle('room:leave', async () => {
     await cleanupRoom()
-    sendToRenderer('room:update', { type: 'left' })
+    send('room:update', { type: 'left' })
   })
 
-  // ── Player ──
+  // ── Player (HTML5 video via MediaServer) ──
   ipcMain.handle('player:selectFile', async () => {
     try {
-      await initMpv()
+      await ensureMediaServer()
+
       const result = await dialog.showOpenDialog(mainWindow, {
         title: '选择视频文件',
-        filters: [
-          { name: '视频文件', extensions: ['mp4', 'mkv', 'mov', 'webm', 'avi', 'flv', 'wmv'] }
-        ],
+        filters: [{ name: '视频文件', extensions: ['mp4', 'mkv', 'mov', 'webm', 'avi', 'flv', 'wmv'] }],
         properties: ['openFile']
       })
-
       if (result.canceled || !result.filePaths[0]) {
-        return { success: false, error: '未选择文件' }
+        return { success: false }
       }
 
       const filePath = result.filePaths[0]
+      const url = mediaServer!.setVideo(filePath)
 
-      // Load into mpv to get duration and test playback
-      mpvPlayer!.loadFile(filePath)
+      // Compute fingerprint (duration will be updated when renderer reports it)
+      currentFingerprint = await computeFingerprint(filePath, 0)
 
-      // Wait for mpv to parse the file
-      await new Promise((r) => setTimeout(r, 1000))
+      // Tell renderer to load the video
+      send('player:loadMedia', { url, filePath })
 
-      const duration = await mpvPlayer!.getDuration()
-      const fingerprint = await computeFingerprint(filePath, duration)
-      currentFingerprint = fingerprint
-
-      // If we're hosting, set the host fingerprint
-      if (roomServer) {
-        roomServer.setHostFingerprint(fingerprint)
-      }
-
-      // If we're a guest, send fingerprint to host for matching
-      if (roomClient) {
-        roomClient.sendFileInfo(fingerprint)
-      }
-
-      return { success: true, filePath, fingerprint }
+      return { success: true, filePath }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      toast(`文件加载失败: ${message}`, 'error')
-      return { success: false, error: message }
+      const msg = err instanceof Error ? err.message : String(err)
+      toast(`文件加载失败: ${msg}`, 'error')
+      return { success: false, error: msg }
     }
   })
 
-  ipcMain.handle('player:play', async () => {
-    if (!mpvPlayer) return
-    mpvPlayer.play()
-    await syncEngine?.onLocalAction()
+  // Renderer reports video duration after metadata loads
+  ipcMain.on('player:duration', (_e, duration: number) => {
+    if (!currentFingerprint) return
+    currentFingerprint.duration = duration
+
+    if (roomServer) {
+      roomServer.setHostFingerprint(currentFingerprint)
+    }
+    if (roomClient) {
+      roomClient.sendFileInfo(currentFingerprint)
+    }
   })
 
-  ipcMain.handle('player:pause', async () => {
-    if (!mpvPlayer) return
-    mpvPlayer.pause()
-    await syncEngine?.onLocalAction()
+  // Renderer reports a user action (play / pause / seek)
+  ipcMain.handle('player:action', (_e, data: { action: string; position: number; paused: boolean }) => {
+    syncEngine?.broadcastAction(data.action, data.position, data.paused)
   })
 
-  ipcMain.handle('player:togglePause', async () => {
-    if (!mpvPlayer) return
-    mpvPlayer.togglePause()
-    await syncEngine?.onLocalAction()
+  // Renderer periodically reports its player state (fire-and-forget)
+  ipcMain.on('player:report', (_e, state) => {
+    send('player:state', state)
   })
 
-  ipcMain.handle('player:seek', async (_e, position: number) => {
-    if (!mpvPlayer) return
-    mpvPlayer.seekTo(position)
-    await syncEngine?.onLocalSeekAction()
-  })
+  // Legacy compatibility
+  ipcMain.handle('player:play', () => {})
+  ipcMain.handle('player:pause', () => {})
+  ipcMain.handle('player:togglePause', () => {})
+  ipcMain.handle('player:seek', () => {})
 
   // ── Subtitle ──
   ipcMain.handle('subtitle:select', async () => {
     try {
-      if (!mpvPlayer) return { success: false, error: 'mpv 未初始化' }
+      await ensureMediaServer()
 
       const result = await dialog.showOpenDialog(mainWindow, {
         title: '选择字幕文件',
-        filters: [
-          { name: '字幕文件', extensions: ['srt', 'vtt', 'ass', 'ssa'] }
-        ],
+        filters: [{ name: '字幕文件', extensions: ['srt', 'vtt', 'ass', 'ssa'] }],
         properties: ['openFile']
       })
-
       if (result.canceled || !result.filePaths[0]) {
-        return { success: false, error: '未选择文件' }
+        return { success: false }
       }
 
-      mpvPlayer.loadSubtitle(result.filePaths[0])
+      const subUrl = mediaServer!.setSubtitle(result.filePaths[0])
+      send('player:loadSubtitle', { url: subUrl, filePath: result.filePaths[0] })
       return { success: true, filePath: result.filePaths[0] }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      toast(`字幕加载失败: ${message}`, 'error')
-      return { success: false, error: message }
+      const msg = err instanceof Error ? err.message : String(err)
+      toast(`字幕加载失败: ${msg}`, 'error')
+      return { success: false, error: msg }
     }
   })
 
   ipcMain.handle('subtitle:remove', () => {
-    if (mpvPlayer) mpvPlayer.removeSubtitle()
+    mediaServer?.clearSubtitle()
+    send('player:loadSubtitle', { url: null })
   })
 
-  ipcMain.handle('subtitle:setSize', (_e, size: number) => {
-    if (mpvPlayer) mpvPlayer.setSubtitleSize(size)
-  })
-
-  ipcMain.handle('subtitle:setPosition', (_e, pos: number) => {
-    if (mpvPlayer) mpvPlayer.setSubtitlePosition(pos)
-  })
+  ipcMain.handle('subtitle:setSize', () => {})
+  ipcMain.handle('subtitle:setPosition', () => {})
 }
 
 async function cleanupRoom(): Promise<void> {
   syncEngine?.destroy()
   syncEngine = null
-
   if (roomServer) {
     discovery?.stopAnnouncing()
     await roomServer.stop()
@@ -339,10 +276,8 @@ async function cleanupRoom(): Promise<void> {
 
 export async function cleanupServices(): Promise<void> {
   await cleanupRoom()
-  if (mpvPlayer) {
-    mpvPlayer.quit()
-    mpvPlayer = null
-  }
+  mediaServer?.stop()
+  mediaServer = null
   if (discovery) {
     await discovery.stop()
     discovery = null
