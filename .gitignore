@@ -5,3 +5,5 @@ dist/
 *.log
 .env
 .env.local
+resources/mpv/mac/
+resources/mpv/win/

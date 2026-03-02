@@ -1,0 +1,31 @@
+appId: com.watchtogether.app
+productName: WatchTogether
+directories:
+  buildResources: build
+  output: dist
+
+extraResources:
+  - from: "resources/mpv/${os}"
+    to: "mpv"
+    filter:
+      - "**/*"
+
+mac:
+  category: public.app-category.entertainment
+  target:
+    - dmg
+    - zip
+
+win:
+  target:
+    - nsis
+    - zip
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  target:
+    - AppImage
+    - deb

@@ -33,8 +33,7 @@ export class SyncEngine extends EventEmitter {
     this.listen()
   }
 
-  /** Called when the local user performs play / pause / seek */
-  broadcastAction(action: string, position: number, paused: boolean): void {
+  broadcastAction(action: string, position: number, paused: boolean, speed = 1): void {
     this.stateVersion++
     if (action === 'seek') {
       this.seekGraceUntil = Date.now() + SYNC_GRACE_PERIOD_MS
@@ -45,7 +44,7 @@ export class SyncEngine extends EventEmitter {
       timestamp: Date.now(),
       position,
       paused,
-      speed: 1
+      speed
     }
 
     if (this.isHost && this.server) {
@@ -77,7 +76,7 @@ export class SyncEngine extends EventEmitter {
 
     this.sendCommand({
       action: 'sync',
-      state: { position: state.position, paused: state.paused }
+      state: { position: state.position, paused: state.paused, speed: state.speed }
     })
   }
 }

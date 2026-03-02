@@ -5,9 +5,9 @@ export default function FileMatchStatus() {
   const isHost = useRoomStore((s) => s.isHost)
   const fileMatched = useRoomStore((s) => s.fileMatched)
   const hostFingerprint = useRoomStore((s) => s.hostFingerprint)
-  const status = usePlayerStore((s) => s.status)
+  const filePath = usePlayerStore((s) => s.filePath)
 
-  if (!status.file) return null
+  if (!filePath) return null
 
   let dotColor = 'bg-fg-tertiary'
   let text = ''
