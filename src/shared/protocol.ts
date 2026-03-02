@@ -2,7 +2,7 @@ import type { FileFingerprint, Member, PlaybackState } from './types'
 
 export const DISCOVERY_PORT = 42424
 export const DISCOVERY_INTERVAL_MS = 3000
-export const ROOM_STALE_MS = 10000
+export const ROOM_STALE_MS = 6000
 export const SYNC_GRACE_PERIOD_MS = 2000
 export const HEARTBEAT_INTERVAL_MS = 5000
 export const RECONNECT_DELAY_MS = 2000
@@ -38,4 +38,10 @@ export interface DiscoveryAnnounce {
 export interface DiscoveryProbe {
   magic: typeof DISCOVERY_MAGIC
   action: 'probe'
+}
+
+export interface DiscoveryGone {
+  magic: typeof DISCOVERY_MAGIC
+  action: 'gone'
+  roomId: string
 }

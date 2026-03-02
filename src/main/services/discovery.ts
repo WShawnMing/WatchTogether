@@ -7,7 +7,7 @@ import {
   ROOM_STALE_MS,
   DISCOVERY_MAGIC
 } from '../../shared/protocol'
-import type { DiscoveryAnnounce, DiscoveryProbe } from '../../shared/protocol'
+import type { DiscoveryAnnounce, DiscoveryProbe, DiscoveryGone } from '../../shared/protocol'
 import type { RoomInfo } from '../../shared/types'
 
 export class DiscoveryService extends EventEmitter {
@@ -38,7 +38,7 @@ export class DiscoveryService extends EventEmitter {
       this.socket!.on('error', reject)
     })
 
-    this.cleanupTimer = setInterval(() => this.cleanStaleRooms(), ROOM_STALE_MS)
+    this.cleanupTimer = setInterval(() => this.cleanStaleRooms(), ROOM_STALE_MS / 2)
   }
 
   startAnnouncing(announce: DiscoveryAnnounce): void {
@@ -48,6 +48,17 @@ export class DiscoveryService extends EventEmitter {
   }
 
   stopAnnouncing(): void {
+    if (this.announcing && this.socket) {
+      const gone: DiscoveryGone = {
+        magic: DISCOVERY_MAGIC,
+        action: 'gone',
+        roomId: this.announcing.roomId
+      }
+      const buf = Buffer.from(JSON.stringify(gone))
+      for (let i = 0; i < 3; i++) {
+        setTimeout(() => this.broadcastToAll(buf), i * 200)
+      }
+    }
     if (this.announceTimer) {
       clearInterval(this.announceTimer)
       this.announceTimer = null
@@ -59,6 +70,20 @@ export class DiscoveryService extends EventEmitter {
     const msg = JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe)
     const buf = Buffer.from(msg)
     this.broadcastToAll(buf)
+  }
+
+  probeIp(ip: string): void {
+    if (!this.socket) return
+    const msg = JSON.stringify({ magic: DISCOVERY_MAGIC, action: 'probe' } as DiscoveryProbe)
+    const buf = Buffer.from(msg)
+    try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, ip) } catch {}
+  }
+
+  removeRoom(roomId: string): void {
+    if (this.rooms.has(roomId)) {
+      this.rooms.delete(roomId)
+      this.emit('rooms-updated', this.getRooms())
+    }
   }
 
   getRooms(): RoomInfo[] {
@@ -87,12 +112,14 @@ export class DiscoveryService extends EventEmitter {
         this.handleAnnounce(data as DiscoveryAnnounce, rinfo.address)
       } else if (data.action === 'probe') {
         if (this.announcing) {
-          this.broadcastAnnounce()
+          // Unicast reply directly to the prober — works across VPN
+          const buf = Buffer.from(JSON.stringify(this.announcing))
+          try { this.socket?.send(buf, 0, buf.length, DISCOVERY_PORT, rinfo.address) } catch {}
         }
+      } else if (data.action === 'gone') {
+        this.handleGone(data as DiscoveryGone)
       }
-    } catch {
-      // ignore malformed messages
-    }
+    } catch {}
   }
 
   private handleAnnounce(data: DiscoveryAnnounce, ip: string): void {
@@ -116,6 +143,13 @@ export class DiscoveryService extends EventEmitter {
     this.emit('rooms-updated', this.getRooms())
   }
 
+  private handleGone(data: DiscoveryGone): void {
+    if (this.rooms.has(data.roomId)) {
+      this.rooms.delete(data.roomId)
+      this.emit('rooms-updated', this.getRooms())
+    }
+  }
+
   private broadcastAnnounce(): void {
     if (!this.announcing || !this.socket) return
     const buf = Buffer.from(JSON.stringify(this.announcing))
@@ -132,23 +166,37 @@ export class DiscoveryService extends EventEmitter {
       if (!addrs) continue
       for (const addr of addrs) {
         if (addr.family !== 'IPv4' || addr.internal) continue
+
+        const prefix = this.maskBits(addr.netmask)
+
+        // 1. Standard subnet broadcast
         const broadcast = this.calcBroadcast(addr.address, addr.netmask)
-        if (sent.has(broadcast)) continue
-        sent.add(broadcast)
-        try {
-          this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, broadcast)
-        } catch {
-          // ignore send errors on specific interfaces
+        if (!sent.has(broadcast)) {
+          sent.add(broadcast)
+          try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, broadcast) } catch {}
+        }
+
+        // 2. For /24 or narrower subnets (VPN networks are typically /24, /31, /32),
+        //    unicast to every host in the /24 block. 254 small UDP packets is negligible.
+        if (prefix >= 24) {
+          const parts = addr.address.split('.').map(Number)
+          const self = parts[3]
+          const base = `${parts[0]}.${parts[1]}.${parts[2]}`
+          for (let i = 1; i < 255; i++) {
+            if (i === self) continue
+            const target = `${base}.${i}`
+            if (!sent.has(target)) {
+              sent.add(target)
+              try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, target) } catch {}
+            }
+          }
         }
       }
     }
 
+    // Global broadcast fallback
     if (!sent.has('255.255.255.255')) {
-      try {
-        this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, '255.255.255.255')
-      } catch {
-        // ignore
-      }
+      try { this.socket.send(buf, 0, buf.length, DISCOVERY_PORT, '255.255.255.255') } catch {}
     }
   }
 
@@ -158,17 +206,11 @@ export class DiscoveryService extends EventEmitter {
     return ipParts.map((p, i) => (p | (~maskParts[i] & 255))).join('.')
   }
 
-  private cleanStaleRooms(): void {
-    const now = Date.now()
-    let changed = false
-    for (const [id, room] of this.rooms) {
-      if (now - room.lastSeen > ROOM_STALE_MS) {
-        this.rooms.delete(id)
-        changed = true
-      }
-    }
-    if (changed) {
-      this.emit('rooms-updated', this.getRooms())
-    }
+  private maskBits(mask: string): number {
+    return mask.split('.').reduce((bits, octet) => {
+      let n = parseInt(octet)
+      while (n) { bits += n & 1; n >>= 1 }
+      return bits
+    }, 0)
   }
 }

@@ -1,10 +1,11 @@
 import { spawn, execFile, ChildProcess } from 'child_process'
 import { promisify } from 'util'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { existsSync, unlinkSync } from 'fs'
 import { createConnection, Socket } from 'net'
 import { EventEmitter } from 'events'
+import { app } from 'electron'
 
 const execFileAsync = promisify(execFile)
 
@@ -297,13 +298,25 @@ export class MpvController extends EventEmitter {
   }
 
   private async findBinary(): Promise<string | null> {
+    // 1. Look for mpv bundled inside the app package
+    const bundled = this.getBundledPath()
+    if (bundled && existsSync(bundled)) {
+      try {
+        await execFileAsync(bundled, ['--no-config', '--vo=null', '--ao=null', '--version'], { timeout: 10000 })
+        return bundled
+      } catch {}
+    }
+
+    // 2. Common system install locations
     const candidates =
       process.platform === 'win32'
         ? ['C:\\Program Files\\mpv\\mpv.exe', 'C:\\mpv\\mpv.exe']
         : ['/opt/homebrew/bin/mpv', '/usr/local/bin/mpv', '/usr/bin/mpv']
     for (const bin of candidates) {
-      try { await execFileAsync(bin, ['--version']); return bin } catch {}
+      try { await execFileAsync(bin, ['--version'], { timeout: 5000 }); return bin } catch {}
     }
+
+    // 3. Fallback to PATH
     try {
       const cmd = process.platform === 'win32' ? 'where' : 'which'
       const { stdout } = await execFileAsync(cmd, ['mpv'])
@@ -311,5 +324,19 @@ export class MpvController extends EventEmitter {
       if (p) return p
     } catch {}
     return null
+  }
+
+  private getBundledPath(): string | null {
+    const isPackaged = app.isPackaged
+    const resourcesPath = isPackaged
+      ? join(dirname(app.getPath('exe')), process.platform === 'darwin' ? '../Resources' : 'resources')
+      : join(app.getAppPath(), 'resources')
+
+    if (process.platform === 'win32') {
+      return join(resourcesPath, 'mpv', 'mpv.exe')
+    } else if (process.platform === 'darwin') {
+      return join(resourcesPath, 'mpv', 'mpv')
+    }
+    return join(resourcesPath, 'mpv', 'mpv')
   }
 }

@@ -6,6 +6,8 @@ const api = {
 
   createRoom: (name: string, password?: string) => ipcRenderer.invoke('room:create', name, password),
   joinRoom: (roomId: string, nickname: string, password?: string) => ipcRenderer.invoke('room:join', roomId, nickname, password),
+  joinByIp: (ip: string, port: number, password?: string) => ipcRenderer.invoke('room:joinByIp', ip, port, password),
+  probeIp: (ip: string) => ipcRenderer.invoke('room:probeIp', ip),
   leaveRoom: () => ipcRenderer.invoke('room:leave'),
   refreshRooms: () => ipcRenderer.invoke('room:refresh'),
 

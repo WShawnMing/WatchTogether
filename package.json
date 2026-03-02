@@ -7,13 +7,14 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "bundle:mpv": "bash scripts/bundle-mpv.sh",
+    "bundle:mpv:mac": "bash scripts/bundle-mpv.sh mac",
+    "bundle:mpv:win": "bash scripts/bundle-mpv.sh win"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.0",
     "@electron-toolkit/utils": "^3.0.0",
-    "node-mpv": "^1.5.0",
-
     "uuid": "^9.0.0",
     "ws": "^8.18.0",
     "zustand": "^4.5.0"
@@ -25,7 +26,7 @@
     "@types/ws": "^8.5.0",
     "@vitejs/plugin-react": "^4.3.0",
     "autoprefixer": "^10.4.0",
-    "electron": "^31.0.0",
+    "electron": "^40.6.1",
     "electron-builder": "^24.0.0",
     "electron-vite": "^2.3.0",
     "postcss": "^8.4.0",

@@ -3,15 +3,17 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PLATFORM="$(uname -s)"
+PLATFORM="${1:-$(uname -s)}"
 ARCH="$(uname -m)"
 
 echo "=== WatchTogether: Bundle mpv ==="
 echo "Platform: $PLATFORM ($ARCH)"
 
-if [ "$PLATFORM" = "Darwin" ]; then
+# ── macOS ──
+if [ "$PLATFORM" = "Darwin" ] || [ "$PLATFORM" = "mac" ]; then
   OUT_DIR="$PROJECT_DIR/resources/mpv/mac"
-  mkdir -p "$OUT_DIR"
+  rm -rf "$OUT_DIR"
+  mkdir -p "$OUT_DIR/lib"
 
   MPV_BIN="$(which mpv 2>/dev/null || echo "")"
   if [ -z "$MPV_BIN" ]; then
@@ -19,36 +21,78 @@ if [ "$PLATFORM" = "Darwin" ]; then
     exit 1
   fi
 
-  echo "Found mpv at: $MPV_BIN"
-  cp "$MPV_BIN" "$OUT_DIR/mpv"
+  # Resolve symlinks to get the real binary
+  MPV_REAL="$(readlink -f "$MPV_BIN" 2>/dev/null || python3 -c "import os; print(os.path.realpath('$MPV_BIN'))")"
+  echo "Found mpv at: $MPV_REAL"
+  cp "$MPV_REAL" "$OUT_DIR/mpv"
   chmod +x "$OUT_DIR/mpv"
 
+  # Bundle dylibs
   if command -v dylibbundler &> /dev/null; then
-    echo "Bundling dylibs with dylibbundler..."
-    mkdir -p "$OUT_DIR/lib"
-    dylibbundler -b -x "$OUT_DIR/mpv" -d "$OUT_DIR/lib/" -p @executable_path/lib/ -od 2>&1 || {
-      echo "Warning: dylibbundler failed. mpv may not work without system libraries."
-      echo "Install dylibbundler: brew install dylibbundler"
-    }
+    echo "Bundling dynamic libraries..."
+    dylibbundler -b -x "$OUT_DIR/mpv" -d "$OUT_DIR/lib/" -p @executable_path/lib/ -od 2>&1
+    echo "dylibbundler complete."
   else
-    echo "Warning: dylibbundler not found. mpv binary may depend on system libraries."
-    echo "For a fully portable build: brew install dylibbundler && re-run this script."
+    echo ""
+    echo "ERROR: dylibbundler is required for a portable build."
+    echo "  Install with: brew install dylibbundler"
+    exit 1
   fi
 
-  echo "Done. mpv bundled to: $OUT_DIR"
+  # Remove quarantine attributes and re-sign everything
+  echo "Re-signing binaries..."
+  xattr -cr "$OUT_DIR"
+  codesign --force --deep --sign - "$OUT_DIR/mpv" 2>/dev/null
+  for dylib in "$OUT_DIR/lib/"*.dylib; do
+    codesign --force --sign - "$dylib" 2>/dev/null
+  done
 
-elif [ "$PLATFORM" = "MINGW64_NT"* ] || [ "$PLATFORM" = "MSYS_NT"* ] || [ "$1" = "win" ]; then
+  # Verify
+  echo "Verifying bundled mpv..."
+  "$OUT_DIR/mpv" --no-config --vo=null --ao=null --version 2>&1 | head -1
+
+  SIZE=$(du -sh "$OUT_DIR" | awk '{print $1}')
+  echo "Done. mpv bundled to: $OUT_DIR ($SIZE)"
+
+# ── Windows ──
+elif [ "$PLATFORM" = "win" ] || [[ "$PLATFORM" == MINGW* ]] || [[ "$PLATFORM" == MSYS* ]]; then
   OUT_DIR="$PROJECT_DIR/resources/mpv/win"
+  rm -rf "$OUT_DIR"
   mkdir -p "$OUT_DIR"
 
-  echo "For Windows: download mpv from https://sourceforge.net/projects/mpv-player-windows/"
-  echo "Extract mpv.exe and all .dll files to: $OUT_DIR"
-  echo ""
-  echo "Or use the following command (requires curl and 7z):"
-  echo "  curl -L -o /tmp/mpv.7z 'https://sourceforge.net/projects/mpv-player-windows/files/64bit/mpv-x86_64-20240101-git-abc1234.7z/download'"
-  echo "  7z x /tmp/mpv.7z -o$OUT_DIR"
+  MPV_URL="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20240414/mpv-x86_64-20240414-git-c0388f4.7z"
+  TEMP_FILE="/tmp/mpv-win.7z"
+
+  if command -v curl &> /dev/null; then
+    echo "Downloading mpv Windows build..."
+    curl -L -o "$TEMP_FILE" "$MPV_URL"
+
+    if command -v 7z &> /dev/null; then
+      7z x "$TEMP_FILE" -o"$OUT_DIR" -y
+      rm "$TEMP_FILE"
+    elif command -v 7zz &> /dev/null; then
+      7zz x "$TEMP_FILE" -o"$OUT_DIR" -y
+      rm "$TEMP_FILE"
+    else
+      echo "Error: 7z not found. Install with: brew install p7zip"
+      echo "Or manually extract $TEMP_FILE to $OUT_DIR"
+      exit 1
+    fi
+
+    echo "Done. mpv bundled to: $OUT_DIR"
+  else
+    echo "Error: curl not found."
+    echo ""
+    echo "Manual setup: download mpv from one of these sources:"
+    echo "  https://github.com/shinchiro/mpv-winbuild-cmake/releases"
+    echo "  https://sourceforge.net/projects/mpv-player-windows/"
+    echo ""
+    echo "Extract mpv.exe and all .dll files to: $OUT_DIR"
+    exit 1
+  fi
 
 else
   echo "Unsupported platform: $PLATFORM"
+  echo "Usage: $0 [mac|win]"
   exit 1
 fi

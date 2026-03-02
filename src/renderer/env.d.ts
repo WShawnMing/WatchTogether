@@ -16,6 +16,8 @@ interface Api {
   setNickname: (nickname: string) => Promise<void>
   createRoom: (name: string, password?: string) => Promise<{ success: boolean; error?: string }>
   joinRoom: (roomId: string, nickname: string, password?: string) => Promise<{ success: boolean; error?: string }>
+  joinByIp: (ip: string, port: number, password?: string) => Promise<{ success: boolean; error?: string }>
+  probeIp: (ip: string) => Promise<void>
   leaveRoom: () => Promise<void>
   refreshRooms: () => Promise<void>
 

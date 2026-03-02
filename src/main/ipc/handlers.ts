@@ -110,6 +110,16 @@ function onMpvExited(): void {
   send('player:fileLoaded', { filePath: null, fileName: null })
 }
 
+function bindRoomClient(client: RoomClient, roomId: string, roomName: string): void {
+  client.on('snapshot', (d) => send('room:update', { type: 'snapshot', members: d.members, playbackState: d.playbackState, hostFingerprint: d.hostFingerprint }))
+  client.on('member-joined', (m) => { send('room:update', { type: 'member_joined', member: m }); toast(`${m.nickname} 加入了房间`) })
+  client.on('member-left', ({ memberId: mid, nickname: nick }) => { send('room:update', { type: 'member_left', memberId: mid, nickname: nick }); toast(`${nick} 离开了房间`) })
+  client.on('file-match', ({ matched }) => { send('room:update', { type: 'file_match', matched }); toast(matched ? '片源匹配成功' : '片源不一致', matched ? 'success' : 'warning') })
+  client.on('room-closed', (reason: string) => { send('room:update', { type: 'closed', reason }); toast(reason, 'warning'); cleanupRoom() })
+  setupSync()
+  send('room:update', { type: 'joined', roomId, roomName, isHost: false })
+}
+
 async function ensureDiscovery(): Promise<void> {
   if (discovery) return
   discovery = new DiscoveryService()
@@ -145,6 +155,13 @@ export function registerIpcHandlers(win: BrowserWindow): void {
     await ensureDiscovery()
     discovery!.triggerProbe()
     send('room:list', discovery!.getRooms())
+  })
+
+  ipcMain.handle('room:probeIp', async (_e, ip: string) => {
+    await ensureDiscovery()
+    discovery!.probeIp(ip.trim())
+    // Wait briefly for response, then send updated list
+    setTimeout(() => send('room:list', discovery!.getRooms()), 1500)
   })
 
   ipcMain.handle('room:create', async (_e, roomName: string, password?: string) => {
@@ -185,13 +202,22 @@ export function registerIpcHandlers(win: BrowserWindow): void {
       if (!room) return { success: false, error: '房间未找到' }
       roomClient = new RoomClient(room.hostIp, room.port, nickname, memberId, password)
       await roomClient.connect()
-      roomClient.on('snapshot', (d) => send('room:update', { type: 'snapshot', members: d.members, playbackState: d.playbackState, hostFingerprint: d.hostFingerprint }))
-      roomClient.on('member-joined', (m) => { send('room:update', { type: 'member_joined', member: m }); toast(`${m.nickname} 加入了房间`) })
-      roomClient.on('member-left', ({ memberId: mid, nickname: nick }) => { send('room:update', { type: 'member_left', memberId: mid, nickname: nick }); toast(`${nick} 离开了房间`) })
-      roomClient.on('file-match', ({ matched }) => { send('room:update', { type: 'file_match', matched }); toast(matched ? '片源匹配成功' : '片源不一致', matched ? 'success' : 'warning') })
-      roomClient.on('room-closed', (reason: string) => { send('room:update', { type: 'closed', reason }); toast(reason, 'warning'); cleanupRoom() })
-      setupSync()
-      send('room:update', { type: 'joined', roomId: room.id, roomName: room.name, isHost: false })
+      bindRoomClient(roomClient, room.id, room.name)
+      return { success: true }
+    } catch (err: unknown) {
+      // Auto-remove stale room from discovery list on connect failure
+      if (discovery) discovery.removeRoom(roomId)
+      send('room:list', discovery?.getRooms() ?? [])
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('room:joinByIp', async (_e, ip: string, port: number, password?: string) => {
+    try {
+      roomClient = new RoomClient(ip.trim(), port, nickname, memberId, password)
+      await roomClient.connect()
+      const roomId = `manual-${ip}:${port}`
+      bindRoomClient(roomClient, roomId, `${ip}:${port}`)
       return { success: true }
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) }
